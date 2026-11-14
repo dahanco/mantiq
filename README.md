@@ -5,6 +5,22 @@
 <p align="center"><b>A fast inference engine for large MoE models, on the hardware you already own</b><br>
 Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMax-M3.1-Flash · private, local, nothing leaves your machine</p>
 
+## Measured speed: decode, same model, same PC
+
+| Engine | Run 1 | Run 2 | Run 3 | Mean | vs. llama.cpp |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Mantiq**, as shipped (MTP + prompt lookup) | 62.2 | 71.7 | 74.3 | **69.4 tok/s** | **1.9×** |
+| **Mantiq**, drafting off (apples to apples) | 47.8 | 52.9 | 53.4 | **51.4 tok/s** | **1.4×** |
+| **llama.cpp**, Vulkan, `-ngl 99 -ncmoe 32`, `tg128` | - | - | - | 36.31 tok/s | baseline |
+| **llama.cpp**, Vulkan, `-ngl 99 -ncmoe 32`, `tg256` | - | - | - | 31.43 ± 3.47 tok/s | baseline |
+
+Tokens per second, decoding only, on one file: `Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf` (Qwen 35B-A3B MoE, Q4_K_M),
+RTX 3070 8 GB, i7-12700K, 32 GB RAM, Windows. Mantiq ran its CUDA path; the llama.cpp build at hand is Vulkan-only (no
+`ggml-cuda.dll`), and `-ncmoe 32` was the best of a 28-38 sweep because 20.2 GiB of weights do not fit in 8 GB of VRAM.
+Reading the prompt is the other half of the story, and there llama.cpp wins: it is about 2.4x faster at prefill, since
+the Qwen MoE path ships with `--prefill 0`. Generating the answer - what a person waiting at the keyboard sees - is
+where the gap goes the other way.
+
 Mantiq is an inference engine. It is not a wrapper around someone else's runtime, and it is not a model server that
 hands the work to a library: it *is* the runtime - the kernels, the memory tiers, the tuner, the server and the
 dashboard, in one process on one machine.
