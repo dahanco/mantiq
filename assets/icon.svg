@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Mantiq">
+  <rect width="1024" height="1024" fill="#0D1117"/>
+  <g fill="none" stroke-width="92" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M202 792 V232" stroke="#E6EDF3"/>
+    <path d="M822 232 V792" stroke="#E6EDF3"/>
+    <path d="M202 232 L512 635.2 L822 232" stroke="#3FB950"/>
+  </g>
+</svg>

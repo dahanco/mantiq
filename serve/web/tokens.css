@@ -1,0 +1,159 @@
+/* Mantiq UI - design tokens, v2: neutral grays with Mantiq's violet as the one accent.
+   Dark is the default (:root); light with <html data-theme="light">.  The page sets data-theme before its first paint
+   from the saved choice ("mntq.theme": dark, light or system).  Every name keeps the --st-* prefix. */
+
+/* Outfit (SIL Open Font License 1.1, serve/web/fonts/OFL.txt): one variable font, weights 100-900 */
+@font-face{font-family:"Outfit";src:url("../fonts/outfit-latin-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"Outfit";src:url("../fonts/outfit-latin-ext-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+
+:root{
+  /* type */
+  --st-font:"Outfit",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --st-font-mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,"Liberation Mono",monospace;
+  --st-fs-xs:12px; --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:15px; --st-fs-chat:16px;
+  --st-fs-lg:18px; --st-fs-xl:22px; --st-fs-stat:22px; --st-fs-display:30px; --st-fs-hero:48px;
+  --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:600; --st-fw-black:700;
+  --st-lh-tight:1.05; --st-lh-body:1.55; --st-lh-chat:1.72;
+
+  /* spacing (4pt) */
+  --st-s-1:4px; --st-s-2:8px; --st-s-3:12px; --st-s-4:16px; --st-s-5:20px;
+  --st-s-6:24px; --st-s-8:32px; --st-s-10:40px; --st-s-12:48px; --st-s-16:64px;
+
+  /* shape */
+  --st-r-xs:5px; --st-r-sm:7px; --st-r-row:8px; --st-r-md:10px; --st-r-lg:12px; --st-r-xl:16px; --st-r-box:20px;
+  --st-r-pill:9999px;
+
+  /* motion */
+  --st-ease:cubic-bezier(.2,.7,.2,1); --st-dur:160ms;
+
+  /* layout */
+  --mntq-side:292px; --mntq-read:724px;
+
+  /* color - dark (the default): a soft neutral gray page, quiet hairlines, one accent, soft depth (calm, modern) */
+  --st-side:#131316;            /* the sidebar */
+  --st-bg:#0f0f11;              /* the page */
+  --st-surface:#18181c;         /* the message box, cards, menus, dialogs */
+  --st-surface-2:#1f1f24;       /* a user's message, hover, chips */
+  --st-surface-3:#28282e;       /* tracks, a disabled send */
+  --st-open:rgba(255,255,255,.055);   /* the open chat's row, the open section */
+  --st-glass-hover:rgba(255,255,255,.04);
+  --st-side-glass:#131316;      /* (flat: the sidebar is opaque now) */
+  --st-glass-sheen:transparent;
+  --st-glass-edge:var(--st-line);
+  --st-line:#252529;
+  --st-line-strong:#34343b;
+  --st-ink:#e9e9ee;
+  --st-ink-soft:#a9a9b2;
+  --st-ink-muted:#77777f;
+
+  --st-accent:#727cd6;
+  --st-accent-hover:#828be0;
+  --st-accent-ink:#0f0f12;      /* text on the accent */
+  --st-accent-text:#aab0ea;     /* the accent as text */
+  --st-accent-tint:rgba(114,124,214,.14);
+  --st-focus:#8b93e6;
+
+  --st-info:#6e8fd8;   --st-info-tint:rgba(110,143,216,.13);   --st-info-text:#9fb6eb;
+  --st-ok:#4cb782;     --st-ok-tint:rgba(76,183,130,.13);      --st-ok-text:#7ed0a5;
+  --st-warn:#d3a24c;   --st-warn-tint:rgba(211,162,76,.13);    --st-warn-text:#e2bd7d;
+  --st-danger:#d96b79; --st-danger-tint:rgba(217,107,121,.13); --st-danger-text:#e79aa3;
+
+  --st-code-bg:#0c0c0e; --st-code-head:#161619; --st-code-ink:#e6e7ef; --st-code-dim:#8f94b0;
+
+  --st-shadow-box:none;
+  --st-shadow-pop:0 12px 32px rgba(0,0,0,.5);
+  --st-shadow-soft:0 6px 20px rgba(0,0,0,.32);   /* (a small popover: a gentle lift) */
+  --st-shadow-sheet:0 -14px 44px rgba(0,0,0,.5);
+  --st-scrim:rgba(0,0,0,.55);
+  --st-push-dim:rgba(0,0,0,.45);   /* the page's edge beside the phone's chats */
+  --st-glass-bg:rgba(24,24,28,.6); --st-glass-line:var(--st-line);
+  --st-glass-bar:rgba(15,15,17,.82); --st-bar-shadow:0 1px 0 var(--st-line);   /* the phone's top bar */
+  --st-switch-knob:#ffffff;
+
+  /* the names the earlier page used (kept so nothing reads an unset variable) */
+  --st-line-soft:var(--st-line); --st-icon:var(--st-ink-soft);
+  --st-bg-glow-1:transparent; --st-bg-glow-2:transparent;
+  --st-sh-card:none; --st-sh-bar:var(--st-shadow-pop); --st-sh-pop:var(--st-shadow-pop); --st-glow:none;
+  color-scheme:dark;
+}
+
+/* color - light */
+[data-theme="light"]{
+  --st-side:#f7f7f8;
+  --st-bg:#ffffff;
+  --st-surface:#ffffff;
+  --st-surface-2:#f5f5f7;
+  --st-surface-3:#ececef;
+  --st-open:rgba(20,20,24,.045);
+  --st-glass-hover:rgba(20,20,24,.035);
+  --st-side-glass:#f7f7f8;
+  --st-glass-sheen:transparent;
+  --st-glass-edge:var(--st-line);
+  --st-line:#ececef;
+  --st-line-strong:#dcdce1;
+  --st-ink:#1a1a1e;
+  --st-ink-soft:#44444c;
+  --st-ink-muted:#71717a;
+
+  --st-accent:#5b64c9;
+  --st-accent-hover:#4f58bd;
+  --st-accent-ink:#ffffff;
+  --st-accent-text:#4a52b8;
+  --st-accent-tint:#eef0fb;
+  --st-focus:#5b64c9;
+
+  --st-info:#3b6fd4;   --st-info-tint:#e8effb;   --st-info-text:#2f5cb0;
+  --st-ok:#2f9e6b;     --st-ok-tint:#e7f5ee;     --st-ok-text:#1f7a50;
+  --st-warn:#b8862b;   --st-warn-tint:#f8f1e2;   --st-warn-text:#8a641c;
+  --st-danger:#cf4b5c; --st-danger-tint:#fbe9eb; --st-danger-text:#a93040;
+
+  --st-code-bg:#0f0f11; --st-code-head:#1a1a1d;
+
+  --st-shadow-box:none;
+  --st-shadow-pop:0 12px 32px rgba(20,20,24,.10);
+  --st-shadow-soft:0 6px 20px rgba(20,20,24,.07);
+  --st-shadow-sheet:0 -14px 44px rgba(20,20,24,.14);
+  --st-scrim:rgba(24,24,29,.35);
+  --st-push-dim:rgba(24,24,29,.16);
+  --st-glass-bg:rgba(255,255,255,.72); --st-glass-line:var(--st-line);
+  --st-glass-bar:rgba(255,255,255,.85); --st-bar-shadow:0 1px 0 var(--st-line);
+  color-scheme:light;
+}
+
+/* The Violet colours (Settings > General > Colours, <html data-scheme="violet">): the same neutral surfaces, only the
+   accent family turns a quiet violet, in the dark theme and the light one */
+:root[data-scheme="violet"]:not([data-theme="light"]){
+  --st-accent:#8f83f2;
+  --st-accent-hover:#a196f6;
+  --st-accent-ink:#0f0f12;
+  --st-accent-text:#b3aaf0;
+  --st-accent-tint:rgba(143,131,242,.14);
+  --st-focus:#a196f6;
+}
+:root[data-scheme="violet"][data-theme="light"]{
+  --st-accent:#6d5cf6;
+  --st-accent-hover:#5a48e8;
+  --st-accent-ink:#ffffff;
+  --st-accent-text:#5143d9;
+  --st-accent-tint:#f0eeff;
+  --st-focus:#6d5cf6;
+}
+
+/* the Teal colours (Settings > General > Colours, <html data-scheme="teal">): the same neutral surfaces, only the accent
+   family turns a quiet cyan / teal, in the dark theme and the light one */
+:root[data-scheme="teal"]:not([data-theme="light"]){
+  --st-accent:#3cc9ba;
+  --st-accent-hover:#6fdfd2;
+  --st-accent-ink:#06201e;
+  --st-accent-text:#72ddcf;
+  --st-accent-tint:rgba(60,201,186,.14);
+  --st-focus:#6fdfd2;
+}
+:root[data-scheme="teal"][data-theme="light"]{
+  --st-accent:#0d9488;
+  --st-accent-hover:#0f766e;
+  --st-accent-ink:#ffffff;
+  --st-accent-text:#0f766e;
+  --st-accent-tint:#d9f5f1;
+  --st-focus:#0d9488;
+}

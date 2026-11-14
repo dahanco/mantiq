@@ -1,0 +1,67 @@
+# Generated, not source: deterministic build products of tools/.
+# tiny-qwen4exp.gguf is ~113 MB, over GitHub's 100 MB file limit -- regenerate with
+#   python tools/make_tiny_model.py
+bench/tiny-*.gguf
+bench/wide-*.gguf
+bench/micro/*.exe
+bench/micro/*.obj
+bench/micro/*.bin
+bench/micro/*.dll
+bench/micro/*.txt
+*.log
+build*/
+pack/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+/.cache/
+
+# plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
+*.nsys-rep
+*.sqlite
+*.npz
+*.occ1
+td.log
+
+# created by setup.py on the user's machine
+/.venv/
+/build/
+/third_party/llama.cpp/
+/models/
+/packs/
+/models_cfg/packs/
+# the models this PC set up are this machine's, not the source's: a fresh checkout starts with an empty model list.
+# The shipped expert profiles (models_cfg/expert-profile-*.bin, the setup's own ranking of each architecture's experts)
+# stay tracked.
+/models_cfg/*.json
+/models_cfg/*.prev
+/models_cfg/token-savings.json*
+/mtp/
+/run-*.bat
+/run-*.sh
+/strata-*.json
+/strata-*.log
+/mntq-*.json
+/mntq-*.json.prev
+/.mntq-switch.json
+/token-savings.json*
+/vision-memory.json
+/run-mntq-*.sh
+/run-mntq-*.bat
+/mntq-report.txt
+/mntq-bench.txt
+/build-strata.bat
+/build-mntq*.bat
+
+# image encoder (setup.py --vision): build output and the generated build script
+build-vision*/
+build-vision.bat
+
+# setup.py outputs (engine, downloads) and release builds
+/engine/
+/build-release*/
+/dist/
+*.done
+/third_party/*.zip
+

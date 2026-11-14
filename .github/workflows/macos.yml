@@ -1,0 +1,38 @@
+# Every push and pull request: the experimental Metal engine (mntq-metal, Apple Silicon) built on GitHub's macOS runner.
+name: macos
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metal:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT): ggml for the build
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: third_party/llama.cpp
+      - name: Metal on this runner
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu
+          system_profiler SPDisplaysDataType || true
+      # as ./mntq.sh --backend metal configures it, with no -mcpu=native
+      - name: Configure mntq-metal
+        run: |
+          cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DMNTQ_ENABLE_METAL=ON \
+            -DMNTQ_METAL_PORTABLE=ON -DMNTQ_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp"
+      - name: Build mntq-metal
+        run: cmake --build build-metal --target mntq-metal -j "$(sysctl -n hw.ncpu)"
+      - name: The engine starts
+        run: ./build-metal/mntq-metal --help

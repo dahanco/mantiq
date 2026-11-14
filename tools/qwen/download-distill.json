@@ -1,0 +1,12 @@
+{
+ "_": "Qwen-3.8-35B-A3B (Distill): empero-ai/Qwen3.8-35B-A3B-Distill-GGUF (Apache-2.0), empero-ai's distillation of Qwen/Qwen3.8-35B-A3B, architecture qwen35moe, in its own GGUF - 35B parameters, 256 experts with 8 routed a token, 40 trunk layers (30 GatedDeltaNet, 10 GQA), up to a 256K context. The `mntq` engine runs it from the file in place (tools/iq_pack.py indexes it; the pack is native, so --serve is served from the verify-window loop - qwen35moe has no batched prefill: --prefill 0). \"revision\" is the commit the files were uploaded at and the file has its sha256: the setup checks it against it. The setup pins Q4_K_M (~21.7 GB); the repo also carries BF16, IQ2_M, Q2_K, IQ3_M, Q3_K_M, IQ4_XS, Q5_K_M, Q6_K and Q8_0. No vision in this file (the repo's mmproj is not needed: the model reads text), and its MTP drafter is built from its NextN block like every model that carries one (tools/mtp_from_gguf.py writes the block's own Q4_K/Q6_K expert bytes, and src/core/mtp.cpp's record_forward_plain is its draft graph); the setup keeps the drafts when the measuring says they are faster.",
+ "name": "Qwen-3.8-35B-A3B-Distill",
+ "repo": "empero-ai/Qwen3.8-35B-A3B-Distill-GGUF",
+ "revision": "b1f9d1dcc3de8aa867669b0ab919384aeeb9b8d5",
+ "license": "Apache-2.0",
+ "about": "Q4_K_M experts, 35B parameters, 8 of 256 experts a token",
+ "memory_gb": 26,
+ "files": {
+  "Qwen3.8-35B-A3B-Q4_K_M.gguf": [21713462944, "196103269085bc54c9b8f49ed21e9f53e1b56b465e8b796c6d8e31e06f63cfa5"]
+ }
+}

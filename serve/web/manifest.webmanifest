@@ -1,0 +1,12 @@
+{
+ "name": "Mantiq",
+ "short_name": "Mantiq",
+ "description": "GLM-5.3-Flash on your own machine",
+ "start_url": "../",
+ "scope": "../",
+ "display": "standalone",
+ "background_color": "#19191d",
+ "theme_color": "#19191d",
+ "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+           {"src": "icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any maskable"}]
+}
