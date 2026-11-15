@@ -813,25 +813,46 @@ def hf_url(repo: str, revision: str, folder: str, file: str) -> str:
     return HF.format(repo=repo, revision=revision, path=f"{folder}/{file}" if folder else file)
 
 
+def write_expert_profile(dst: Path, n_layer: int, n_expert: int) -> Path | None:
+    """An expert profile for a model of this geometry, written when the tree ships none.
+
+    The prebuilt packages carry no expert profile (the shipped files are Mantiq's own ranking of a model's experts, so
+    a package leaves them out), and `--spec` refuses to run without the device residency table a profile builds (it is
+    staged only with a non-empty profile, src/program/generate.cpp).  With no learned ranking to start from,
+    tools/make_profile.py lays every pair out for us (`--no-base`: interleaved across the layers), so the VRAM slots
+    start empty and the adaptive tier learns this PC's routing as it runs.  The profile written, or None."""
+    if dst.is_file():
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    r = run([sys.executable, str(ROOT / "tools" / "make_profile.py"), "--no-base",
+             "--n-layer", str(n_layer), "--n-expert", str(n_expert), "--out", str(dst)], check=False)
+    return dst if r.returncode == 0 and dst.is_file() else None
+
+
 def qwen_expert_profile(pack: Path) -> Path | None:
     """The `--expert-profile` a qwen35moe pack's `--spec` needs, or None.
 
     `--spec` refuses to run without the device residency table a profile builds (generate.cpp), and the engine's
-    read_expert_profile refuses a profile whose (layers, experts) are not the model's own.  The family's shipped
-    QWEN_PROFILE is passed only when its header's dimensions are this pack's (native_experts.txt: one line a layer,
-    its header the expert count) - every 35B-A3B qwen35moe here is 40x256, so the same file serves them all.  None
-    when a pack of another shape is added: the engine then reports the missing residency table itself."""
+    read_expert_profile refuses a profile whose (layers, experts) are not the model's own (native_experts.txt: one line
+    a layer, its header the expert count).  A shipped QWEN_PROFILE is passed only when its header's dimensions are
+    this pack's - every 35B-A3B qwen35moe here is 40x256, so the same file serves them all - and where no profile is
+    shipped (the prebuilt packages: write_expert_profile) one is written for the pack's own geometry.  None when the
+    pack does not say (a --gguf config has no pack): the engine then reports the missing residency table itself."""
     f = pack / "native_experts.txt"
-    if not (f.is_file() and QWEN_PROFILE.is_file()):
+    if not f.is_file():
         return None
-    head = QWEN_PROFILE.read_bytes()[:16]
-    if len(head) < 16 or head[:4] != b"STRP":
-        return None
-    _, n_layer, n_expert = struct.unpack_from("<3I", head, 4)
     text = f.read_text(encoding="utf-8")
     m = re.search(r"n_expert (\d+)", text)
     layers = sum(1 for line in text.splitlines() if line[:1].isdigit())
-    return QWEN_PROFILE if m and (layers, int(m.group(1))) == (n_layer, n_expert) else None
+    if not m or layers < 1:
+        return None
+    if QWEN_PROFILE.is_file():
+        head = QWEN_PROFILE.read_bytes()[:16]
+        if len(head) == 16 and head[:4] == b"STRP":
+            _, n_layer, n_expert = struct.unpack_from("<3I", head, 4)
+            if (layers, int(m.group(1))) == (n_layer, n_expert):
+                return QWEN_PROFILE
+    return write_expert_profile(QWEN_PROFILE, layers, int(m.group(1)))
 
 
 def read_json(path: Path) -> dict:
@@ -7121,8 +7142,9 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp: bool = True) -> Pa
                  "--out", str(pack / "mtp")], env=env, check=False)
         if r.returncode != 0 or not (pack / "mtp" / "dense.txt").exists():
             warn("no MTP drafter could be built from this model file: drafting falls back to prompt lookup alone")
-    if QWEN_PROFILE.exists():                          # (the shipped ranking of the experts: which start in VRAM)
-        shutil.copyfile(QWEN_PROFILE, pack / "expert-profile.bin")
+    prof = qwen_expert_profile(pack)                   # (the ranking of the experts: which start in VRAM; written
+    if prof:                                           #  here for the pack's own geometry when none is shipped)
+        shutil.copyfile(prof, pack / "expert-profile.bin")
     stamp_pack(pack, files)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
@@ -7724,13 +7746,11 @@ def add_model_flow(a) -> Path | None:
         args += ["--max-context", str(ctx),
                  "--spec", "4", "--prompt-window", "16", "--suffix-draft", "4", "--mtp-max-t", "2" if mtp else "1",
                  "--expert-cache", "auto", "--prefill", "0", "--stop-eos", "--adapt-every", "16"]
-        if arch in ("qwen35moe", "qwen35"):
-            # (--spec needs the device residency table a profile builds; the family's 40x256 file serves every 35B-A3B)
-            prof = qwen_expert_profile(pack)
-            if prof:
-                args += ["--expert-profile", str(prof)]
-        elif QWEN_PROFILE.exists():
-            args += ["--expert-profile", str(QWEN_PROFILE)]
+        # (--spec needs the device residency table a profile builds: the family's own file when its geometry is this
+        #  pack's - every 35B-A3B qwen35moe is 40x256 - and one written for the pack's geometry when none is shipped)
+        prof = qwen_expert_profile(pack)
+        if prof:
+            args += ["--expert-profile", str(prof)]
         if mtp:
             args += ["--mtp", str(pack / "mtp")]
     ok(f"pack: {pack}")

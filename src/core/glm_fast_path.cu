@@ -1331,8 +1331,51 @@ bool Glm5Model::fast_setup(std::string& err) {
         // ... and all it can ever take: every expert with the spares and a prompt's room, ~15% more (Mantiq-S on a Radeon
         // 8065S lends a prompt 25 slots a layer beside its 291) - a budget beyond that is not checked
         const size_t all_b = (size_t) (g.n_expert + gf::kSpares) * stride_sum / 20 * 23;
+        // THE TINY POOL: the start is not refused on a machine whose memory cannot hold that floor.  One slot a layer
+        // is enough there (the tiny pool below: an expert that is not resident comes from the entry's own scratch
+        // slot, the RAM tier, the CPU lane and the SSD - slow by construction, and the fastest measured setting on an
+        // 8 GB card).  The FLOOR decides it, and every later term is priced from the floor chosen - the budget, the
+        // reserve's own adaptation down to 300 MiB, the prompt path's chunk - so nothing is asked of a card that does
+        // not have it.  Automatic, so that no machine meets the refusal; STRATA_GLM_TINY_POOL=1 asks for it up front,
+        // =0 keeps the refusal.
+        bool tiny_pool = false;
+        {
+            const char* lr = part_ > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
+            const char* r = lr != nullptr && lr[0] ? lr : getenv("STRATA_GLM_RESERVE_MB");
+            const bool given = r != nullptr && r[0];
+            if (const char* v = getenv("STRATA_GLM_TINY_POOL")) {
+                tiny_pool = std::atoi(v) != 0;
+            } else if (F->unified_memory) {
+                // (an APU's budget is RAM's: the terms pool_budget prices it with, its headroom included)
+                double head_gb = 16.0;
+                if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+                const size_t head = (size_t) (head_gb * 1073741824.0);
+                const size_t reserve = (size_t) (given ? std::max(0LL, std::atoll(r)) : 1024) << 20;
+                const int64_t ram = avail_ram_now();
+                const size_t room = ram > (int64_t) head ? (size_t) ram - head : 0;
+                tiny_pool = room < reserve + floor_b;
+                if (tiny_pool)
+                    std::fprintf(stderr, "glm fast: CUDA%d %.2f GB of RAM for the model, less than the reserve "
+                                         "(%.2f GB) and the expert pool's floor (%.2f GB): the tiny pool instead - one "
+                                         "slot a layer, every other expert from the RAM tier, the CPU lane and the SSD\n",
+                                 dev_, (double) room / 1073741824.0, (double) reserve / 1073741824.0,
+                                 (double) floor_b / 1073741824.0);
+            } else {
+                const size_t reserve = (size_t) (given ? std::max(0LL, std::atoll(r)) : 700) << 20;
+                size_t f = 0, t = 0;
+                cudaMemGetInfo(&f, &t);
+                tiny_pool = f < reserve + floor_b;
+                if (tiny_pool)
+                    std::fprintf(stderr, "glm fast: CUDA%d %.2f GB of VRAM free, less than the reserve (%.2f GB) and "
+                                         "the expert pool's floor (%.2f GB): the tiny pool instead - one slot a layer, "
+                                         "every other expert from the RAM tier, the CPU lane and the SSD\n", dev_,
+                                 (double) f / 1073741824.0, (double) reserve / 1073741824.0,
+                                 (double) floor_b / 1073741824.0);
+            }
+        }
+        const size_t pool_floor = tiny_pool ? stride_sum : floor_b;
         // --expert-cache auto: the budget checked once written, before the prompt path sizes its chunk from it
-        pool_check(floor_b, stride_max, all_b);
+        pool_check(pool_floor, stride_max, all_b);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
@@ -1347,7 +1390,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
         // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget)
-        pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
+        pool_b_ = part_budget(free_b, total_b, pool_floor, stride_max);
         const size_t reserve = pool_b_.reserve;
         size_t avail = pool_b_.avail;
         if (pool_b_.adapted)
@@ -1426,22 +1469,18 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (tot <= avail) break;
             --per;
         }
-        // STRATA_GLM_TINY_POOL=1: accept a pool smaller than one route a layer (the default refuses it).  A route's
-        // experts that are not resident land in the entry's own scratch slot - the path a full pool already takes
-        // when its spares are gone (moe_route, a.d.scratch[i]) - so the decode still runs: on the RAM tier, the CPU
-        // lane and, for what neither holds, the SSD.  Slow by construction; it exists to start on a card the default
-        // rejects.  Off by default: the refusal is the sane answer.
-        static const bool tiny_pool = [] {
-            const char* v = getenv("STRATA_GLM_TINY_POOL");
-            return v != nullptr && std::atoi(v) != 0;
-        }();
-        const int per_min = tiny_pool ? 1 : g.n_exp_used;
+        // the least the pool may hold: a route's experts a layer - or, with the tiny pool chosen above, a single slot
+        // (its experts that are not resident land in the entry's own scratch slot: moe_route, a.d.scratch[i] - the
+        // path a full pool already takes when its spares are gone), and, where even one slot a layer is out of reach
+        // (a desktop holding most of a small card), none at all: every expert of every route then comes from the RAM
+        // tier, the CPU lane and the SSD.  The engine still runs, which is the point of the tiny pool.
+        const int per_min = tiny_pool ? 0 : g.n_exp_used;
         if (per < per_min) {
             // what is short, and what makes room
             const size_t need = (size_t) per_min * stride_sum;
             const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
             err = "glm fast: CUDA" + std::to_string(dev_) + " has no room for the expert pool: " + std::to_string(per) +
-                  " slots a layer, at least " + std::to_string(g.n_exp_used) + " needed (about " +
+                  " slots a layer, at least " + std::to_string(per_min) + " needed (about " +
                   std::to_string(short_mib) + " MiB more). To make room: " +
                   (pool_b_.fixed > 0 ? "a larger --expert-cache (" + std::to_string(pool_b_.fixed) + " now) or auto, "
                                      : std::string()) +
@@ -1590,7 +1629,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 // slot a layer here, the loop places the rest by routing share, the draft layer's own block keeps its
                 // share - all inside `avail`, nothing asked of a card that does not have it.
                 const int base_slots = g.n_exp_used + gf::kSpares + k_extra;
-                const int fl = tiny_pool ? 1 : std::min(cap, std::max(base_slots, std::min(per, base_slots + 16)));
+                const int fl = tiny_pool ? std::min(1, per) : std::min(cap, std::max(base_slots, std::min(per, base_slots + 16)));
                 size_t used = 0;
                 for (int il = l0_; il < lt_; ++il)
                     if (F->L[(size_t) il].moe) {
