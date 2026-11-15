@@ -166,16 +166,17 @@ dashboard's Models page has the button, or `./mntq.sh --add-local-model <file.gg
 | Qwen-35B-A3B SignOfFour Coder | [pragmaticcs/Qwen-35B-A3B-SignOfFour-Coder-GGUF](https://huggingface.co/pragmaticcs/Qwen-35B-A3B-SignOfFour-Coder-GGUF/tree/main) |
 
 **The Maya line: GLM-5.3-Flash quantized for this engine.** These are the large ones the tiering and the calibration
-exist for; the setup's ids are Mantiq's now and the folders on Hugging Face still carry Maya's names - both are accepted.
+exist for; the names above are the files' own, and the setup accepts them by its `Mantiq-*` ids or by the Maya names the
+Hugging Face folders carry.
 
 | Quant | Size | What it is | Repository |
 | --- | --- | --- | --- |
-| `Mantiq-XS-IQ1_S` (Maya-XS) | 73.4 GB | the smallest of them: a 64 GB PC with a 24 GB card at 128K context | [Maya-XS](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-XS) |
-| `Mantiq-S24` (Maya-S24) | 94.7 GB | about 1.5 GB less that stays on the GPU, so 24 GB cards hold more experts (about 14% faster decode there) | [Maya-S24](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-S24) |
-| `Mantiq-S-v2-IQ2_XXS` (Maya-S) | 96.5 GB | the compact one: error-feedback-rounded IQ2_XXS experts, IQ2_S / IQ3_XXS down projections, Q6_K attention, the MTP draft block | [Maya-S](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-S-v2-IQ2_XXS) |
-| `Mantiq-M` (Maya-M) | 116.0 GB | IQ2_S gate / up experts, IQ3_XXS down projections (IQ3_S in the most sensitive layers) | [Maya-M](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-M) |
-| `Mantiq-M-Derisked` | 116.0 GB | Maya-M with a directional weight edit by Blackfrost_AI that reduces blanket refusals (experimental) | [Maya-M-Derisked](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF) |
-| `Mantiq-L` (Maya-L) | 156.3 GB | the largest: IQ3_S gate / up experts, IQ4_XS down projections (Q5_K in the most sensitive layers) | [Maya-L](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-L) |
+| `GLM-5.3-Flash-Maya-XS-IQ1_S` | 73.4 GB | the smallest of them: a 64 GB PC with a 24 GB card at 128K context | [Maya-XS](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-XS) |
+| `GLM-5.3-Flash-Maya-S24` | 94.7 GB | about 1.5 GB less that stays on the GPU, so 24 GB cards hold more experts (about 14% faster decode there) | [Maya-S24](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-S24) |
+| `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS` | 96.5 GB | the compact one: error-feedback-rounded IQ2_XXS experts, IQ2_S / IQ3_XXS down projections, Q6_K attention, the MTP draft block | [Maya-S](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-S-v2-IQ2_XXS) |
+| `GLM-5.3-Flash-Maya-M` | 116.0 GB | IQ2_S gate / up experts, IQ3_XXS down projections (IQ3_S in the most sensitive layers) | [Maya-M](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-M) |
+| `GLM-5.3-Flash-Maya-M-Derisked` | 116.0 GB | Maya-M with a directional weight edit by Blackfrost_AI that reduces blanket refusals (experimental) | [Maya-M-Derisked](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF) |
+| `GLM-5.3-Flash-Maya-L` | 156.3 GB | the largest: IQ3_S gate / up experts, IQ4_XS down projections (Q5_K in the most sensitive layers) | [Maya-L](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF/tree/main/Maya-L) |
 
 GLM-5.3-Flash has published EXL3 quants too - [3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw),
 [4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw),

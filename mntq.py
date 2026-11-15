@@ -3567,6 +3567,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     metal = is_ggml_engine(pc.get("backend"))   # Metal or the CPU engine: ggml reads the GGUF files itself
     # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
     # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
+    # --expert-cache-per-layer is NOT passed here: it makes `slots_ / n_layers` leave a remainder, so the pool is
+    # never 100% full and the startup residency snapshot (`d.host_res`) desyncs from the live cache - the CPU pool
+    # and the GPU hit kernel then both compute the same expert and the layer sums it twice.  Measured on Qwopus
+    # 35B-A3B (40x256, 2130 slots): coherent output at 100% full, a single repeated token whenever it is below.
+    # --expert-cache-evict is NOT passed here either: it lets the live cache drop an expert the snapshot still
+    # calls resident, which is the same desync (it stayed safe only because no eviction actually fired).
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
     cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--expert-cache", "auto",
@@ -7596,14 +7602,50 @@ def add_model_setup(a) -> Path:
     return llama
 
 
-def add_model_flow(a) -> Path | None:
-    """The model list's last line ("Add Your Model"): a Qwen3.5/3.6-MoE GGUF file of the user's own.  It asks for the
-    file's full path, builds its pack - the engine's index of the model file, and the MTP drafter from its NextN block
-    when it has one - beside the project's other packs (models_cfg/packs/<name>) and writes its config
-    (models_cfg/mntq-<name>.json), so the model is offered with the others on the next start.  The engine, the GPUs,
-    the port and the environment are taken from the newest qwen config (this PC's own setup) when there is one."""
+def add_glm_model_flow(a, src: Path) -> Path | None:
+    """A GLM-5.3-Flash GGUF file of the user's own (glm5-next): its pack, beside the model files (pack_step uses a
+    pack/ that already indexes these files as it is), and the config write_config writes (mntq-<quant>.json), so the
+    model is offered with the others on the next start.  The engine settings this PC's own GLM config carries - its
+    VRAM reserve, KV format, expert cache and environment - stay for the new model too."""
+    files = gguf_shards(src)
+    quant = quant_of(files[0])
+    cfg_path = ROOT / f"mntq-{quant.lower()}.json"
+    if cfg_path.exists():
+        ok(f"{cfg_path.name} is already in the list: nothing was added")
+        return cfg_path
+    prev = next((c for c in map(read_json, configs()) if Q.family_of(c) == "glm"), {})
+    ctx = int(flag_value(prev.get("args") or [], "--max-context") or DEFAULT_CONTEXT)
+    llama = add_model_setup(a)                       # (llama.cpp's gguf-py for the pack, and the engine to run it)
+    pc = check_pc(a, "glm")
+    d = files[0].parent
+    pack = (metal_tokenizer_step(a, d, files, quant) if is_ggml_engine(pc.get("backend"))
+            else pack_step(a, d, files, llama, quant))
+    cfg_path = write_config(a, pc, read_json(STAMP), pack, quant, ctx, d, None,
+                            ("local", files[0]), None, files[0])
+    cfg = read_json(cfg_path)
+    metal = is_ggml_engine(pc.get("backend"))
+    kept = [] if metal else keep_args(prev.get("args") or [], cfg["args"],
+                                      ("--kv", "--vram-reserve-mib", "--expert-cache", "--kv-streaming"))
+    if prev.get("env"):
+        # (the hand-tuned environment of this PC's GLM setup: this portable build needs its own, e.g. a tiny pool)
+        cfg["env"] = {**prev["env"], **(cfg.get("env") or {})}
+        kept += [f"env {k}" for k in prev["env"]]
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     say()
-    say("  Add a model of your own: a Qwen3.5/3.6-MoE GGUF file (qwen35moe).")
+    say(f"  {quant} ({src.name}) was added: start {ME} again and it is in the list.")
+    return cfg_path
+
+
+def add_model_flow(a) -> Path | None:
+    """The model list's last line ("Add Your Model"): a GLM-5.3-Flash or Qwen3.5/3.6-MoE GGUF file of the user's own.
+    It asks for the file's full path, builds its pack - the engine's index of the model file, and the MTP drafter from
+    its NextN block when it has one - beside the project's other packs and writes its config, so the model is offered
+    with the others on the next start.  The engine, the GPUs, the port and the environment are taken from the newest
+    config of the same family (this PC's own setup) when there is one."""
+    say()
+    say("  Add a model of your own: a GLM-5.3-Flash (glm5-next) or a Qwen3.5/3.6-MoE (qwen35moe) GGUF file.")
     given = str(getattr(a, "add_local_model", "") or "").strip().strip('"').strip("'")
     if not given:                                    # (--add-local-model: the Models page's button, no question asked)
         given = ask_text("  Its full path (.gguf)", "", a.yes).strip().strip('"').strip("'")
@@ -7615,9 +7657,12 @@ def add_model_flow(a) -> Path | None:
         fail(f"{src} is not a file", "give the full path of the model's .gguf file (shard 1, when it is split)")
     meta = gguf_metadata(src)
     arch = str(meta.get("general.architecture") or "")
+    if arch in GLM_ARCHS:
+        return add_glm_model_flow(a, src)
     if arch not in QWEN_ARCHS:
-        fail(f"{src.name}: its general.architecture is {arch or 'unreadable'}, not a Qwen MoE (qwen35moe)",
-             "the qwen path serves qwen35moe / qwen4exp GGUF files")
+        fail(f"{src.name}: its general.architecture is {arch or 'unreadable'}, neither GLM-5.3-Flash (glm5-next) "
+             "nor a Qwen MoE (qwen35moe)",
+             "this flow takes glm5-next / glm5next and qwen35moe / qwen4exp GGUF files")
     if not int(meta.get(f"{arch}.expert_count") or 0):
         # a dense Qwen (qwen35: no ffn_*_exps.weight and no expert_count): the engine serves routed experts only, so
         # its pack would have nothing to serve - say so here, before the pack builder spends minutes and then fails
@@ -8000,7 +8045,7 @@ def main() -> int:
         add = len(shown) + 1
         # the last line: a model of the user's own - add_model_flow builds its pack and config, then leaves, so the
         # next start offers it with the others
-        say(f"  {add}) Add Your Model (example: Qwen3.6..gguf)")
+        say(f"  {add}) Add Your Model (example: GLM-5.3..gguf or Qwen3.6..gguf)")
         choice = int(ask("Which one?", [str(i) for i in range(1, add + 1)], "1", a.yes))
         if choice == add:
             add_model_flow(a)

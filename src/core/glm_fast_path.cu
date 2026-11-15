@@ -2213,10 +2213,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int s = 0; s < R.n; ++s) F->rload.back()[(size_t) s].store(0);
         }
         if (F->ahead_read) {
-            // STRATA_GLM_AHEAD_READERS: the LOOKAHEAD reader threads (default 2).  Each takes one queued expert (its
-            // three parts) at a time, so the outstanding set is what bounds the prefetch, not the threads - more than
-            // a couple only shortens the queue's tail when a single token queues a burst.
-            int n_rd = 2;
+            // STRATA_GLM_AHEAD_READERS: the LOOKAHEAD reader threads (default 4).  Each takes one queued expert (its
+            // three parts) at a time, so the outstanding set is what bounds the prefetch, not the threads - but on a
+            // disk-bound decode a single token queues a burst (up to disk_skip_from a layer), and 4 drains that tail
+            // faster without changing which experts are read.
+            int n_rd = 4;
             if (const char* v = getenv("STRATA_GLM_AHEAD_READERS")) n_rd = std::max(1, std::min(8, std::atoi(v)));
             for (int i = 0; i < n_rd; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
         }
@@ -4973,10 +4974,12 @@ void Glm5Model::fast_service() {
                 }
                 // each part in chunks across the workers: the O_DIRECT bounce copy of a whole part was ~0.4 ms of the
                 // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; STRATA_GLM_READ_CHUNKS overrides - a Windows
-                // laptop on an Intel RST RAID read 15% faster with 4, #67 - and setup's calibration tries 4 and 2)
+                // laptop on an Intel RST RAID read 15% faster with 4, #67 - and setup's calibration tries 4 and 2).
+                // The default is 8: the disk (not the compute) dominates a disk-bound decode, and 8 keeps the stream
+                // route on (3 * rch <= 32).  Set STRATA_GLM_READ_CHUNKS=2 for the old conservative behaviour.
                 static const int rch_env = [] {
                     const char* v = getenv("STRATA_GLM_READ_CHUNKS");
-                    return std::max(1, std::min(16, v ? std::atoi(v) : 2));
+                    return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
                 const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
@@ -5278,13 +5281,14 @@ void Glm5Model::fast_ahead_route(int il, const int* ids, unsigned int miss, cons
         for (int i = 0; i < 8; ++i) F->ah_pred[(size_t) la][(size_t) d][(size_t) i] = ahead[d][i];
     }
     if (!F->ahead_read) return;
-    // STRATA_GLM_AHEAD_INFLIGHT: how many LOOKAHEAD reads may be outstanding at once (default 8; the old fixed cap
+    // STRATA_GLM_AHEAD_INFLIGHT: how many LOOKAHEAD reads may be outstanding at once (default 16; the old fixed cap
     // of 4 turned would-be fills away - "queue full" in the ahead line - while the predictions they carried were the
     // ones a route then waited on).  A read that lands early is a disk wait the route does not pay; one that lands
-    // late is no worse than reading it at the route.  Bounded by the free RAM slots and the L2 staging ring.
+    // late is no worse than reading it at the route.  Bounded by the free RAM slots and the L2 staging ring (which
+    // holds n_ahead layers x 16 experts - 128 at the default n_ahead - so 16 fits comfortably).
     static const int kMaxInflight = [] {
         const char* v = getenv("STRATA_GLM_AHEAD_INFLIGHT");
-        return v != nullptr ? std::max(1, std::min(64, std::atoi(v))) : 8;
+        return v != nullptr ? std::max(1, std::min(64, std::atoi(v))) : 16;
     }();
     bool queued = false;
     for (int d = 0; d < F->n_ahead; ++d) {   // the nearest layer first: its reads are the most urgent
