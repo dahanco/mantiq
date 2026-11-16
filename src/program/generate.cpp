@@ -5912,9 +5912,19 @@ int main(int argc, char** argv) {
         }
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
-    // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
+    // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would.
+    //
+    // AND ONLY WHILE A SLOT'S OCCUPANT IS FIXED.  Those sizes are the sizes of the pairs in PROFILE ORDER, which
+    // is the order `admit` fills the free slots in and nothing else.  A cache that may change an occupant breaks
+    // the correspondence: `--expert-cache-evict` hands a victim's slot to a newcomer of ANOTHER layer, whose blob
+    // can be the larger one, and `--expert-cache-per-layer` fills by LAYER RANGE rather than in profile order -
+    // measured there, slot 704 (layer 16's first) was sized 1,769,472 B while layer 16's blob is 2,039,808 B, so
+    // the fill's tail ran into the slot after it and `verify_slot` failed at byte 1769472.  Both get slots of the
+    // largest blob instead: correct by construction, at ~0.3% of the slots on this Q4_K_M pack (13% blob spread)
+    // and up to ~23% on an IQ3_XXS one.
     std::vector<int64_t> sized_slots;
-    if (native_pack && o.expert_cache > 0 && !profile.empty()) {
+    if (native_pack && o.expert_cache > 0 && !profile.empty() && !o.expert_cache_evict &&
+        !o.expert_cache_per_layer) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
