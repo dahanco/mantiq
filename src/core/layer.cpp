@@ -427,8 +427,12 @@ if (db != nullptr && g_publish_kernel) {
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
-// ---- the shared expert.  Its three weights are quantized, so they need their planes.
-SForm f_gate, f_up, f_down;    if (!sform_of(*w_sgate, f_gate, v.name("ffn_gate_shexp.weight"), err)) return false;    if (!sform_of(*w_sup, f_up, v.name("ffn_up_shexp.weight"), err)) return false;    if (!sform_of(*w_sdown, f_down, v.name("ffn_down_shexp.weight"), err)) return false;    Planes p_gate, p_up, p_down;    if (!plane_ptrs(*w_sgate, v.name("ffn_gate_shexp.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_sup, v.name("ffn_up_shexp.weight"), p_up, err)) return false;    if (!plane_ptrs(*w_sdown, v.name("ffn_down_shexp.weight"), p_down, err)) return false;
+// ---- the shared expert.  A projection is either a RESIDENT F16 MATRIX (`WeightKind::F16InF32`), whose arena
+//      bytes are its own fp16 form and are read by `f16_gemv_fp32_mmvf` with no S-form at all, or a quantized
+//      tensor that needs its planes.  Asking `sform_of` for an F16 one is the error this guard avoids - it
+//      refuses anything with `code_bits == 0`.
+const auto wants_planes = [](const WeightRef* w) { return w->kind != WeightKind::F16InF32; };
+SForm f_gate, f_up, f_down;    if (wants_planes(w_sgate) && !sform_of(*w_sgate, f_gate, v.name("ffn_gate_shexp.weight"), err)) return false;    if (wants_planes(w_sup) && !sform_of(*w_sup, f_up, v.name("ffn_up_shexp.weight"), err)) return false;    if (wants_planes(w_sdown) && !sform_of(*w_sdown, f_down, v.name("ffn_down_shexp.weight"), err)) return false;    Planes p_gate, p_up, p_down;    if (wants_planes(w_sgate) && !plane_ptrs(*w_sgate, v.name("ffn_gate_shexp.weight"), p_gate, err)) return false;    if (wants_planes(w_sup) && !plane_ptrs(*w_sup, v.name("ffn_up_shexp.weight"), p_up, err)) return false;    if (wants_planes(w_sdown) && !plane_ptrs(*w_sdown, v.name("ffn_down_shexp.weight"), p_down, err)) return false;
 // `ffn_gate_inp_shexp` is a 1-D BF16 vector, so THE ARENA HOLDS 2 BYTES PER ELEMENT, not 4 - the loader
 // re-rounded it to the engine form like any other BF16 tensor.  Reading it as f32 is 5120 bytes past the
 // end of a 5120-byte tensor inside a 4.5 GiB arena, where nothing faults.  Refuse here rather than trust
@@ -447,6 +451,11 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     native.gate_type = w_sgate->native_type; native.gate_data = w_sgate->native_data;
     native.up_type = w_sup->native_type; native.up_data = w_sup->native_data;
     native.down_type = w_sdown->native_type; native.down_data = w_sdown->native_data;
+    // A resident F16 projection hands over its own arena bytes instead of GGUF blocks; its `native_type` is
+    // irrelevant and `shared_expert` reads it with `f16_gemv_fp32_mmvf`.
+    if (w_sgate->kind == WeightKind::F16InF32) { native.gate_f16 = true; native.gate_data = w_sgate->data; }
+    if (w_sup->kind == WeightKind::F16InF32) { native.up_f16 = true; native.up_data = w_sup->data; }
+    if (w_sdown->kind == WeightKind::F16InF32) { native.down_f16 = true; native.down_data = w_sdown->data; }
     // The NativeDense owner publishes one shared workspace for this ordered session stream.
     native.q8_1 = w_sgate->native_q8_1 ? w_sgate->native_q8_1 :
                   w_sup->native_q8_1 ? w_sup->native_q8_1 : w_sdown->native_q8_1;

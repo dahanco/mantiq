@@ -28,6 +28,8 @@ void shared_expert_set_native_bf16(bool enabled);
 /// Optional native GGUF projections. Each supported type with nonnull data
 /// replaces only that canonical projection; absent or unsupported entries fall
 /// back independently. Any active entry selects pinned FP32 SwiGLU arithmetic.
+/// A resident F16 projection (`gate_f16`/`up_f16`/`down_f16`) replaces its
+/// canonical projection the same way, without GGUF blocks and without Q8_1.
 /// Caller owns device weights and Q8_1 scratch for the largest active input
 /// (n_embd for gate/up, n_ff for down), sized by native_q8_1_bytes. All storage
 /// must survive graph execution; use one ordered nonnull stream with no overlap.
@@ -37,6 +39,11 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
+    /// A projection whose `*_data` points at a RESIDENT F16 MATRIX (`WeightKind::F16InF32`) rather than GGUF
+    /// blocks.  Its arena bytes are its own fp16 form, one output row of n_in contiguous elements, so the F32
+    /// activation is dotted against it by `f16_gemv_fp32_mmvf`.  The matching `*_type` is then meaningless and
+    /// `q8_1` is not read for that projection; each of the three is independent.
+    bool gate_f16 = false, up_f16 = false, down_f16 = false;
 };
 
 /// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL USED TO `cudaMalloc` FOUR BUFFERS ON

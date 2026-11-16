@@ -22,6 +22,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gemv.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
@@ -165,6 +166,16 @@ __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restri
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[(size_t) t * n + i] *= g[t];
 }
+
+// One projection of a RESIDENT F16 matrix for 1..8 activation rows: `x[t * n_in]` against `w[j * n_in + i]`,
+// output rows contiguous (`y[t * n_out + j]`).  The single-row call is taken when there is one row so a
+// one-token window is the same arithmetic the token path runs.
+void f16_proj_rows(const float* x, const uint16_t* w, float* y, int n_in, int n_out, int n_tok, void* stream) {
+    if (n_tok == 1)
+        strata::kernels::f16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream);
+    else
+        strata::kernels::f16_gemv_fp32_mmvf_multi(x, n_in, w, y, n_out, n_in, n_out, n_tok, stream);
+}
 }  // namespace
 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
@@ -182,16 +193,35 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         }
         return;
     }
-    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
+    // EACH projection is independently a resident F16 matrix or a native GGUF weight.  An F16 one is read by
+    // `f16_gemv_fp32_mmvf` straight from its arena bytes and never touches the Q8_1 scratch or its type id.
+    const bool gate_f16 = nw.gate_f16 && nw.gate_data != nullptr;
+    const bool up_f16 = nw.up_f16 && nw.up_data != nullptr;
+    const bool down_f16 = nw.down_f16 && nw.down_data != nullptr;
+    const bool gate_nat = !gate_f16 && nw.gate_data != nullptr && native_mmvq_supported(nw.gate_type);
+    const bool up_nat = !up_f16 && nw.up_data != nullptr && native_mmvq_supported(nw.up_type);
+    const bool down_nat = !down_f16 && nw.down_data != nullptr && native_mmvq_supported(nw.down_type);
+    if (n_tok < 1 || n_tok > 8 || !stream || !(gate_f16 || gate_nat) || !(up_f16 || up_nat) ||
+        !(down_f16 || down_nat) || ((gate_nat || up_nat || down_nat) && !nw.q8_1))
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
-    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
-    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    if (gate_nat || up_nat) native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+    if (gate_f16)
+        f16_proj_rows(x, (const uint16_t*) nw.gate_data, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+    else
+        native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+    if (up_f16)
+        f16_proj_rows(x, (const uint16_t*) nw.up_data, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    else
+        native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
     const int n = (int) (n_ff * n_tok);
     native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
-    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    if (down_f16)
+        f16_proj_rows(gate, (const uint16_t*) nw.down_data, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    else {
+        native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+        native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    }
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
@@ -228,14 +258,21 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    const NativeSharedWeights* native) {
     if (n_embd <= 0 || n_ff <= 0) return;
     const bool use_native = native_bf16;
-    const bool native_gate = native && native->gate_data && native_mmvq_supported(native->gate_type);
-    const bool native_up = native && native->up_data && native_mmvq_supported(native->up_type);
-    const bool native_down = native && native->down_data && native_mmvq_supported(native->down_type);
-    const bool native_projection = native_gate || native_up || native_down;
-    if ((use_native || native_gate || native_up) && !x_f32)
+    // EACH projection picks its own form: a resident F16 matrix, a native GGUF weight, or the canonical
+    // S-form.  An F16 one is checked first because its `native_data` is null and `native_mmvq_supported(1)`
+    // is false, so every branch below would refuse it.
+    const bool gate_f16 = native && native->gate_f16 && native->gate_data != nullptr;
+    const bool up_f16 = native && native->up_f16 && native->up_data != nullptr;
+    const bool down_f16 = native && native->down_f16 && native->down_data != nullptr;
+    const bool native_gate = !gate_f16 && native && native->gate_data && native_mmvq_supported(native->gate_type);
+    const bool native_up = !up_f16 && native && native->up_data && native_mmvq_supported(native->up_type);
+    const bool native_down = !down_f16 && native && native->down_data && native_mmvq_supported(native->down_type);
+    const bool native_quantized = native_gate || native_up || native_down;
+    const bool native_projection = native_quantized || gate_f16 || up_f16 || down_f16;
+    if ((use_native || gate_f16 || up_f16 || native_gate || native_up) && !x_f32)
         throw std::invalid_argument("shared_expert native input projection requires unrounded x_f32");
     if (native_projection) {
-        if (!native->q8_1 || !stream || n_embd > INT_MAX || n_ff > INT_MAX)
+        if (!stream || n_embd > INT_MAX || n_ff > INT_MAX || (native_quantized && !native->q8_1))
             throw std::invalid_argument("shared_expert native projections require scratch, stream and int32 dimensions");
         // Validate every active shape before any kernel is enqueued.
         if (native_gate) native_mmvq_weight_bytes(native->gate_type, (int) n_embd, (int) n_ff);
@@ -278,11 +315,15 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // gate and up projections, then silu(gate) * up in place in `gate`
     if (native_gate || native_up)
         native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
-    if (native_gate)
+    if (gate_f16)
+        f16_gemv_fp32_mmvf(x_f32, (const uint16_t*) native->gate_data, gate, (int) n_embd, (int) n_ff, stream);
+    else if (native_gate)
         native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
     else
         gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
-    if (native_up)
+    if (up_f16)
+        f16_gemv_fp32_mmvf(x_f32, (const uint16_t*) native->up_data, up, (int) n_embd, (int) n_ff, stream);
+    else if (native_up)
         native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
@@ -293,8 +334,10 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 
     // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
     // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
-    // justification beyond "the kernel takes fp16".
-    if (native_down) {
+    // justification beyond "the kernel takes fp16".  An F16 down weight reads the F32 SwiGLU output directly.
+    if (down_f16) {
+        f16_gemv_fp32_mmvf(gate, (const uint16_t*) native->down_data, out, (int) n_ff, (int) n_embd, stream);
+    } else if (native_down) {
         native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
     } else if (down_form.act_kind == 1) {

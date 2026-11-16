@@ -544,8 +544,22 @@ __device__ __forceinline__ float vec_dot_q2_K_q8_1(const void* __restrict__ vbq,
 }
 
 // ---------------------------------------------------------------- the formats
+// F16 (GGML_TYPE_F16): the row is raw fp16, so there is NO block scale to strip and the format is its own
+// dequantized form.  `qk = 32` pairs it with one q8_1 activation block, whose own scale `d` is applied once
+// after the multiply - the same 32 values per call the quantized formats use, only decoded as floats.
+__device__ __forceinline__ float vec_dot_f16_q8_1(const void* __restrict__ v, const block_q8_1* __restrict__ bq8_1,
+                                                  const int& kbx, const int& iqs) {
+    (void) iqs;
+    const __half* w = (const __half*) v + 32 * (size_t) kbx;   // `v` is the row base, `kbx` the weight block
+    float acc = 0.0f;
+    for (int i = 0; i < 32; ++i) acc += __half2float(w[i]) * (float) bq8_1->qs[i];
+    return acc * __low2float(bq8_1->ds);
+}
+
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
+template<> struct Fmt<1> { static constexpr int qk = 32, ipb = 1, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_f16_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<16> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -1149,6 +1163,7 @@ bool iq_dequant_supported(int t) noexcept { return is_iq(t) || t == 12 || t == 1
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
+        case 1: return (size_t) n * sizeof(uint16_t);   // GGML_TYPE_F16: a plain fp16 row, no blocks
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
@@ -1272,6 +1287,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
     switch (L.gu_type) {
+        case 1: native_gu_kernel<1><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -1295,6 +1311,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
+        case 1: native_down_kernel<1><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 16: native_down_kernel<16><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 17: native_down_kernel<17><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 18: native_down_kernel<18><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

@@ -209,10 +209,17 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+            std::vector<std::string> names;   // v3/v4: the shard(s) that hold this layer's experts (beside --native)
+            for (std::string w; ss >> w;) names.push_back(w);
+            if (!names.empty()) {
+                if (names.size() != 1 && names.size() != 3) {
+                    err = "native_experts.txt: layer " + std::to_string(l) + " names " + std::to_string(names.size()) +
+                          " shards (one for the whole layer, or one per gate/up/down role)";
+                    return false;
+                }
+                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) (3 * n_layers), std::string());
+                for (int r = 0; r < 3; ++r)   // one name: the whole blob; three: the roles may straddle shards
+                    L.gguf_file[(size_t) (3 * l + r)] = names[names.size() == 1 ? 0 : (size_t) r];
             }
         }
         L.fmt[(size_t) l] = f;

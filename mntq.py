@@ -712,6 +712,9 @@ QWEN_CONTEXTS = [32768, 65536, 131072, 262144]     # (the model's native reach: 
 QWEN_DEFAULT_CONTEXT = 65536
 QWEN_MIN_CC = 70                                   # (V100 on: the Qwen path's kernels are validated from Volta)
 QWEN_PROFILE = PROFILES / "expert-profile-qwen.bin"
+# a qwen35moe pack's own routing record (`tools/glm_expert_coverage.py --capture ... --trace <pack>/routing-trace.bin`):
+# the experts THIS model routes, in frequency order - what builds its own profile (qwen_expert_profile)
+QWEN_TRACE = "routing-trace.bin"
 # KV bytes a context token: 12 attention layers x K and V (2 heads x 256) in INT8 with an FP16 scale a 64 values, and the
 # indexer's pooled keys.  INT8 is the setup's KV format (--kv int8: the model card's own llama.cpp line runs q8_0 K / V;
 # the attention's time the same as FP16's, half its VRAM left to experts)
@@ -829,15 +832,34 @@ def write_expert_profile(dst: Path, n_layer: int, n_expert: int) -> Path | None:
     return dst if r.returncode == 0 and dst.is_file() else None
 
 
-def qwen_expert_profile(pack: Path) -> Path | None:
-    """The `--expert-profile` a qwen35moe pack's `--spec` needs, or None.
+def profile_dims(path: Path) -> tuple[int, int] | None:
+    """The (layers, experts) a profile's header declares (expert_cache.hpp's shape), or None when it is not one."""
+    try:
+        head = path.read_bytes()[:16]
+        if len(head) == 16 and head[:4] == b"STRP":
+            _, n_layer, n_expert = struct.unpack_from("<3I", head, 4)
+            return n_layer, n_expert
+    except OSError:
+        pass
+    return None
 
-    `--spec` refuses to run without the device residency table a profile builds (generate.cpp), and the engine's
-    read_expert_profile refuses a profile whose (layers, experts) are not the model's own (native_experts.txt: one line
-    a layer, its header the expert count).  A shipped QWEN_PROFILE is passed only when its header's dimensions are
-    this pack's - every 35B-A3B qwen35moe here is 40x256, so the same file serves them all - and where no profile is
-    shipped (the prebuilt packages: write_expert_profile) one is written for the pack's own geometry.  None when the
-    pack does not say (a --gguf config has no pack): the engine then reports the missing residency table itself."""
+
+def qwen_expert_profile(pack: Path) -> Path | None:
+    """The `--expert-profile` this qwen35moe pack's `--spec` needs, kept inside the pack, or None.
+
+    A model's ranking of its experts is its own: the same 40x256 geometry serves many qwen35moe files, but each routes
+    a different few of its 256 experts, so a file built for one of them leaves another reading most of its routes from
+    RAM (measured on Hermes3.6: 5.3 tok/s on the family's ranking against 8.8 on its own).  The profile therefore
+    lives beside the weights (<pack>/expert-profile.bin, as DeepSeek's does) and is built for exactly this pack's
+    geometry - read from native_experts.txt (one line a layer, `n_expert N` its header), which read_expert_profile
+    also checks the header against (generate.cpp refuses a profile that is not the model's own).
+
+    In order of preference: the pack's own profile, when its header is this geometry (built by an earlier call, or
+    learned while the model was served - `--expert-profile-save` writes it back here); then one built from the pack's
+    own routing record (<pack>/routing-trace.bin, `tools/glm_expert_coverage.py --capture`), which is what ranks the
+    experts the model actually routes; then the family's shipped ranking copied in as a warm start, so a model with no
+    record yet still starts better than interleaved.  None when the pack does not say (a --gguf config has no pack):
+    the engine then reports the missing residency table itself."""
     f = pack / "native_experts.txt"
     if not f.is_file():
         return None
@@ -846,13 +868,23 @@ def qwen_expert_profile(pack: Path) -> Path | None:
     layers = sum(1 for line in text.splitlines() if line[:1].isdigit())
     if not m or layers < 1:
         return None
-    if QWEN_PROFILE.is_file():
-        head = QWEN_PROFILE.read_bytes()[:16]
-        if len(head) == 16 and head[:4] == b"STRP":
-            _, n_layer, n_expert = struct.unpack_from("<3I", head, 4)
-            if (layers, int(m.group(1))) == (n_layer, n_expert):
-                return QWEN_PROFILE
-    return write_expert_profile(QWEN_PROFILE, layers, int(m.group(1)))
+    dims = (layers, int(m.group(1)))
+    dst = pack / "expert-profile.bin"
+    if profile_dims(dst) == dims:
+        return dst                                    # this model's own, already built or learned here
+    trace = pack / QWEN_TRACE
+    if trace.is_file():
+        seed = QWEN_PROFILE if profile_dims(QWEN_PROFILE) == dims else None
+        args = [sys.executable, str(ROOT / "tools" / "make_profile.py"), "--out", str(dst),
+                "--n-layer", str(layers), "--n-expert", str(dims[1])]
+        # the record's own pairs first (most routed first), the family's ranking after it, then the rest
+        args += (["--reorder", "--base", str(seed)] if seed else ["--no-base"]) + [str(trace)]
+        if run(args, check=False).returncode == 0 and profile_dims(dst) == dims:
+            return dst
+    if profile_dims(QWEN_PROFILE) == dims:
+        shutil.copyfile(QWEN_PROFILE, dst)            # no record yet: the family's ranking, but kept per model
+        return dst
+    return write_expert_profile(dst, layers, dims[1])
 
 
 def read_json(path: Path) -> dict:
@@ -4695,10 +4727,11 @@ def start(cfg_path: Path, a) -> int:
     return after_server(run_server(cmd, env=env), a)
 
 
-def serve_no_model(a) -> int:
-    """Nothing is set up yet: Mantiq's dashboard in this terminal and in the browser, on the Models page - a model of
-    the user's own is added there (Add Local Model), and switching to it starts Mantiq with it.  No model is asked for,
-    nothing is downloaded and no name is shown."""
+def serve_no_model(a, models: int = 0) -> int:
+    """Mantiq's dashboard in this terminal and in the browser, on the Models page: no model is asked for here and no
+    name is typed as a number.  With nothing set up, a model of the user's own is added there (Add Local Model);
+    with `models` set up, one of them is started there (Switch to this) and Mantiq starts again with it - nothing is
+    downloaded, and the start stops asking which model to run."""
     # A fresh download reaches here (START-MNTQ.bat / ./mntq.sh: .venv is made, then mntq.py runs), and the server's
     # Python packages are otherwise installed by the setup's own step.  The dashboard IS a Python server, so they are
     # installed here too - before it starts, or its `import jinja2` ends in a traceback instead of the Models page.
@@ -4730,9 +4763,11 @@ def serve_no_model(a) -> int:
         cmd.append("--open")                           # a desktop: the browser opens on the Models page
     say()
     say("  " + "-" * 100)
-    say("  No model is set up here yet: Mantiq's dashboard opens in the browser.")
+    say(f"  Mantiq's dashboard opens in the browser: start a model there ({models} set up here)." if models else
+        "  No model is set up here yet: Mantiq's dashboard opens in the browser.")
     say(f"  Dashboard:        http://{here}:{port}/#models")
-    say("  Add one there:    Models > Add Local Model (a GGUF file on this PC)")
+    say("  Start one there:  Models > the model's row > Switch to this" if models else
+        "  Add one there:    Models > Add Local Model (a GGUF file on this PC)")
     say("  Ctrl+C (or closing this terminal) stops it.")
     say("  " + "-" * 100)
     env = dict(os.environ, MNTQ_RESTART_ON_UPDATE="1",   # (switching to the model added: Mantiq starts again with it)
@@ -7142,10 +7177,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp: bool = True) -> Pa
                  "--out", str(pack / "mtp")], env=env, check=False)
         if r.returncode != 0 or not (pack / "mtp" / "dense.txt").exists():
             warn("no MTP drafter could be built from this model file: drafting falls back to prompt lookup alone")
-    prof = qwen_expert_profile(pack)                   # (the ranking of the experts: which start in VRAM; written
-    if prof:                                           #  here for the pack's own geometry when none is shipped)
-        shutil.copyfile(prof, pack / "expert-profile.bin")
-    stamp_pack(pack, files)
+    qwen_expert_profile(pack)                          # (the ranking of the experts that start in VRAM: built for
+    stamp_pack(pack, files)                            #  this model's own geometry, inside the pack - no copy to make)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
@@ -7163,7 +7196,8 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     hip = pc.get("backend") == "hip"
     cfg_path = ROOT / f"{Q.config_stem('qwen', 'q5_k_m')}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
-    profile = pack / "expert-profile.bin"
+    profile = qwen_expert_profile(pack)                # (this model's own ranking, built inside the pack if the pack
+                                                       #  was stamped before this call existed)
     # the Qwen path, the settings the working configs are tuned to (SignOfFour): the pack, the model file for its
     # native weights and its n-gram table, decode windows of up to 4 tokens (prompt-lookup drafts, --suffix-draft),
     # MTP drafts off (--mtp-max-t 1), prompts written whole (--prefill 0) and stopping at the model's own end token,
@@ -7171,8 +7205,8 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(gguf), "--max-context", str(ctx),
             "--spec", "4", "--prompt-window", "16", "--suffix-draft", "4", "--mtp-max-t", "1",
             "--expert-cache", "auto", "--prefill", "0", "--stop-eos", "--adapt-every", "16", "--kv", QWEN_KV]
-    if profile.exists():
-        args += ["--expert-profile", str(profile)]
+    if profile:
+        args += ["--expert-profile", str(profile), "--expert-profile-save", str(profile)]
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
@@ -7500,8 +7534,9 @@ def write_config_qwen_moe(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: 
     # the same Qwen path as CYBER-FROST's, without the pieces a qwen35moe file has none of: no --ple-gguf (no n-gram
     # table to open) and prompts written whole (--prefill 0: no batched prefill).  --mtp carries the drafter the setup
     # built from the model's NextN block when it has one (--mtp-max-t 2: drafts of up to two tokens), and the engine's
-    # prompt lookup (--suffix-draft) drafts alongside it.  --expert-profile carries the family's 40x256 file
-    # (qwen_expert_profile: --spec needs the device residency table the profile builds).
+    # prompt lookup (--suffix-draft) drafts alongside it.  --expert-profile carries this model's own file, built inside
+    # its pack (qwen_expert_profile: --spec needs the device residency table the profile builds), and
+    # --expert-profile-save writes back what the tiers learn, so a served model's ranking is its own and improves.
     mtp = (pack / "mtp" / "dense.txt").exists()
     args = ["--pack", str(pack), "--native", str(gguf), "--max-context", str(ctx),
             "--spec", "4", "--prompt-window", "16", "--suffix-draft", "4", "--mtp-max-t", "2" if mtp else "1",
@@ -7510,7 +7545,7 @@ def write_config_qwen_moe(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: 
         args += ["--mtp", str(pack / "mtp")]
     prof = qwen_expert_profile(pack)
     if prof:
-        args += ["--expert-profile", str(prof)]
+        args += ["--expert-profile", str(prof), "--expert-profile-save", str(prof)]
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf"))
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -7746,11 +7781,11 @@ def add_model_flow(a) -> Path | None:
         args += ["--max-context", str(ctx),
                  "--spec", "4", "--prompt-window", "16", "--suffix-draft", "4", "--mtp-max-t", "2" if mtp else "1",
                  "--expert-cache", "auto", "--prefill", "0", "--stop-eos", "--adapt-every", "16"]
-        # (--spec needs the device residency table a profile builds: the family's own file when its geometry is this
-        #  pack's - every 35B-A3B qwen35moe is 40x256 - and one written for the pack's geometry when none is shipped)
+        # (--spec needs the device residency table a profile builds: this pack's own, built from its geometry and its
+        #  routing record when it has one - the family's shipped file is only a model's warm start, never the ranking)
         prof = qwen_expert_profile(pack)
         if prof:
-            args += ["--expert-profile", str(prof)]
+            args += ["--expert-profile", str(prof), "--expert-profile-save", str(prof)]
         if mtp:
             args += ["--mtp", str(pack / "mtp")]
     ok(f"pack: {pack}")
@@ -8058,19 +8093,28 @@ def main() -> int:
         # model is asked for, nothing is downloaded, and no name is shown (a model of the user's own is added there)
         return serve_no_model(a)
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
-        say()
-        shown = configs_by_name(have)    # (by name: the list reads as a list, not by when each model was last run)
-        for i, c in enumerate(shown, 1):
-            say(f"  {i}) {c.name}")
-        add = len(shown) + 1
-        # the last line: a model of the user's own - add_model_flow builds its pack and config, then leaves, so the
-        # next start offers it with the others
-        say(f"  {add}) Add Your Model (example: GLM-5.3..gguf or Qwen3.6..gguf)")
-        choice = int(ask("Which one?", [str(i) for i in range(1, add + 1)], "1", a.yes))
-        if choice == add:
-            add_model_flow(a)
-            return 0
-        pick = shown[choice - 1]
+        if a.config is not None:
+            pick = have[0]               # (--config: that one, no question - a run script and a switch land here)
+        elif not (a.calibrate or a.speed_calibration):
+            # a start of its own (START-MNTQ.bat / ./mntq.sh, nothing asked for): no model is asked for in this
+            # terminal - the dashboard opens in the browser on the Models page, where the model is started (its
+            # "Switch to this"), which starts Mantiq again with it, also with no question
+            return serve_no_model(a, len(have))
+        else:
+            say()
+            shown = configs_by_name(have)  # (by name: the list reads as a list, not by when each model was last run)
+            for i, c in enumerate(shown, 1):
+                say(f"  {i}) {c.name}")
+            add = len(shown) + 1
+            # the last line: a model of the user's own - add_model_flow builds its pack and config, then leaves, so
+            # the next start offers it with the others.  (--calibrate and --speed-calibration are the only starts that
+            # still ask: the model they measure must be named here, the dashboard cannot tune one)
+            say(f"  {add}) Add Your Model (example: GLM-5.3..gguf or Qwen3.6..gguf)")
+            choice = int(ask("Which one?", [str(i) for i in range(1, add + 1)], "1", a.yes))
+            if choice == add:
+                add_model_flow(a)
+                return 0
+            pick = shown[choice - 1]
         check_parallel(a, config_family(read_json(pick)))
         if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)

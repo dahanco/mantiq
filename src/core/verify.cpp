@@ -644,8 +644,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         return false;
                     const int64_t max_ids = st.max_cells < cap_ ? st.max_cells : cap_;
                     quantize_q8_1_cols(xm, xq_, (int) N, n, cs);
-                    mmvq_cols(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                    mmvq_cols(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    proj_cols(wk, xm, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    proj_cols(wv, xm, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                     if (g_qsa != nullptr && l == 3 && grp == 0) {   // TEMP DIAGNOSTIC
                         cudaMemcpyAsync(g_qsa + 11 * (size_t) N, xm, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs);
                         cudaMemcpyAsync(g_qsa + 12 * (size_t) N, vcur_ + tb * NKV * HD, (size_t) (NKV * HD) * 4,
@@ -680,7 +680,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                            vcur_ + t * NKV * HD, s, cs, &st.host);
                     }
                     stamp(l, 9, grp);
-                    mmvq_cols(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                    proj_cols(wq, xm, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                 (int) (NH * 2 * HD), n, cs);
                     if (g_qsa != nullptr && l == 3 && grp == 0)   // TEMP DIAGNOSTIC
                         cudaMemcpyAsync(g_qsa, qfull_ + tb * NH * 2 * HD, (size_t) (NH * 2 * HD) * 4,
@@ -740,7 +740,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                         cudaMemcpyDeviceToDevice, cs);
                     stamp(l, 14, grp);
                     quantize_q8_1_cols(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                    mmvq_cols(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                    proj_cols(wo, attn32_ + tb * NH * HD, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
                     if (g_qsa != nullptr && l == 3 && grp == 0)   // TEMP DIAGNOSTIC
                         cudaMemcpyAsync(g_qsa + 10 * (size_t) N, bo_ + tb * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs);
                 } else {
@@ -762,8 +762,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
-                mmvq_cols(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                mmvq_cols(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                proj_cols(wk, xm, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                proj_cols(wv, xm, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): K and V rotated before they are stored
@@ -797,7 +797,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                               (float) qsa_freq_base(), cs);
                 stamp(l, 9, grp);
-                mmvq_cols(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
+                proj_cols(wq, xm, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {
                     if (cudaMemcpy2DAsync(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
@@ -852,7 +852,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 14, grp);
                 quantize_q8_1_cols(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                mmvq_cols(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                proj_cols(wo, attn32_ + tb * NH * HD, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
                 }
             }
         } catch (const std::exception& e) {
@@ -914,6 +914,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
+            // A resident F16 projection is served from its own arena bytes; see `shared_expert`'s F16 branch.
+            if (wsg->kind == WeightKind::F16InF32) { nsw.gate_f16 = true; nsw.gate_data = wsg->data; }
+            if (wsu->kind == WeightKind::F16InF32) { nsw.up_f16 = true; nsw.up_data = wsu->data; }
+            if (wsd->kind == WeightKind::F16InF32) { nsw.down_f16 = true; nsw.down_data = wsd->data; }
             nsw.q8_1 = xq_;
             if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
             else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
