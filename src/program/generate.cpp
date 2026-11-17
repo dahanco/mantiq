@@ -9424,7 +9424,12 @@ int main(int argc, char** argv) {
             // new `x` - the same invariant the decode loop above starts from.  A long prompt is many windows, so
             // each one beats the progress clock (the serve watchdog ends the process after 60 s of silence).
             auto read_turn = [&](const std::vector<int64_t>& t, std::string& e) -> bool {
-                std::vector<int32_t> rin((size_t) o.spec), rout((size_t) o.spec), rnxt((size_t) o.spec);
+                // The prompt read's window: `--prompt-window` when set, the decode window (`o.spec`) otherwise.
+                // The verifier was `init`ed with `max(o.spec, o.prompt_window)`, so a `--prompt-window`-sized
+                // window fits the arena and its captured graph; a wider prompt window changes only how the
+                // prompt is read and leaves the decode rounds' own window alone.
+                const int pw = o.prompt_window > 0 ? o.prompt_window : (int) o.spec;
+                std::vector<int32_t> rin((size_t) pw), rout((size_t) pw), rnxt((size_t) pw);
                 const int64_t base = p;
                 ver.set_head_sampling(false);
                 for (int64_t i = 0; i + 1 < (int64_t) t.size();) {
@@ -9433,7 +9438,7 @@ int main(int argc, char** argv) {
                         ver.set_head_sampling(true);
                         return false;
                     }
-                    const int T = (int) std::min<int64_t>(o.spec, (int64_t) t.size() - 1 - i);
+                    const int T = (int) std::min<int64_t>(pw, (int64_t) t.size() - 1 - i);
                     for (int q = 0; q < T; ++q) {
                         rin[(size_t) q] = (int32_t) t[(size_t) (i + q)];
                         rnxt[(size_t) q] = (int32_t) t[(size_t) (i + q + 1)];
