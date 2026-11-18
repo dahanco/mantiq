@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 
 namespace mntq::metal {
@@ -1293,8 +1294,10 @@ bool GlmMetal::save_profile(std::string& err) const {
         ok = ok && std::fwrite(v, 2, 2, f) == 2;
     }
     ok = std::fclose(f) == 0 && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (std::rename does not, on Windows)
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
         err = "cannot write " + path;
         return false;
     }
