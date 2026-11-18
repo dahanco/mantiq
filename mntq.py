@@ -798,9 +798,14 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     return {"mntq": EXE, "mntq-ds4": DS4_EXE, "mntq-mm3": MM3_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
-# the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
-# its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
+# GLM's shipped expert profile (tools/make_profile.py --glm): the family's ranking of every (layer, expert) pair, which
+# decides each layer's VRAM slots and which experts start there.  It is a pack's warm start now, not what a model serves
+# from: a GLM pack keeps its own profile inside itself (<pack>/expert-profile.bin, glm_expert_profile), seeded from this
+# file when the pack has none and this ranking is of its geometry, and --expert-profile-save rewrites that pack file
 PROFILE = PROFILES / "expert-profile-glm.bin"
+# the geometry Mantiq writes a GLM profile with itself (tools/make_profile.py's GLM_LAYER/GLM_EXPERT: 45 decoder layers
+# plus the NextN block, 288 routed experts) - only the pack of a model the shipped ranking does not fit needs one
+GLM_PROFILE_LAYERS = 46
 # DeepSeek's starting expert profile (tools/ds4/profile.py): a pack without a profile of its own starts from it - the
 # engine reads it to place the most-routed experts in VRAM and read the next ones ahead, then adds this PC's routing to
 # it and saves it in the pack (<pack>/expert-profile.bin); its counts are scaled to a few thousand tokens' worth, so
@@ -885,6 +890,60 @@ def qwen_expert_profile(pack: Path) -> Path | None:
         shutil.copyfile(QWEN_PROFILE, dst)            # no record yet: the family's ranking, but kept per model
         return dst
     return write_expert_profile(dst, layers, dims[1])
+
+
+def glm_expert_profile(pack: Path) -> Path:
+    """The `--expert-profile` a GLM model reads at load and --expert-profile-save rewrites after each request, kept
+    inside the model's own folder (<pack>/expert-profile.bin, as a qwen35moe pack's and DeepSeek's are) so a model's
+    ranking is its own and a start reads back what the last request learned.
+
+    A pack with no profile of its own starts from the shipped family ranking (PROFILE, models_cfg/expert-profile-glm.bin)
+    copied in, when that ranking is of this pack's geometry.  A pack it does not fit (a pruned model - the engine refuses
+    a profile of another size, "a profile for a different artifact") starts from an empty interleaved file written for
+    its own geometry (write_expert_profile), which the adaptive tier then learns this PC's routing into.  Metal / the CPU
+    engine pass the same pack (their tokenizer and this profile live in it), so the same seeding applies."""
+    have = pack_expert_count(pack)
+    dst = pack / "expert-profile.bin"
+    if have is None:                                   # (no native_experts.txt: the pack does not state its geometry)
+        return PROFILE if PROFILE.is_file() else dst
+    if dst.is_file():
+        return dst                                     # this model's own, seeded before or learned while it served
+    if PROFILE.is_file() and profile_experts(PROFILE) == have:
+        try:
+            shutil.copyfile(PROFILE, dst)              # no profile yet: the family's ranking, but kept per model
+            return dst
+        except OSError:
+            pass
+    return write_expert_profile(dst, GLM_PROFILE_LAYERS, have) or dst
+
+
+def ggml_expert_profile(gguf: Path, dst: Path) -> Path | None:
+    """The `--expert-profile` a ggml engine (Metal / the CPU engine) reads, kept at `dst` (the model's own folder).
+
+    These engines read the GGUF file itself, so the seed of first resort is the pack's own profile
+    (glm_expert_profile / qwen_expert_profile over the pack both engines now share) and this is the fallback for
+    when that pack states no geometry.  With no seed and every expert resident (the pool then routes through fixed
+    slots and counts no usage, ExpertPool::count is called nowhere), the engine's --expert-profile-save rewrites an
+    empty order after every request and the file stays 24 bytes - the header alone, which is what a real CPU
+    package's own expert-profile.bin was.  This writes the interleaved profile of the model's own geometry
+    (write_expert_profile, tools/make_profile.py --no-base), the "no learned ranking yet" start the packs begin
+    from, which the engine reads at load and writes back.  The profile at `dst`, or None when the file does not
+    state its geometry (its block_count and expert_count)."""
+    if not Path(gguf).is_file():
+        return None
+    if dst.is_file():
+        if dst.stat().st_size > 24:                    # (24 bytes: the header alone, an empty order)
+            return dst
+        try:
+            dst.unlink()                               # ... which a profile that ranks the pairs replaces
+        except OSError:
+            pass
+    meta = gguf_metadata(gguf)
+    arch = str(meta.get("general.architecture") or "")
+    layers, experts = int(meta.get(f"{arch}.block_count") or 0), int(meta.get(f"{arch}.expert_count") or 0)
+    if layers < 1 or experts < 1:
+        return None
+    return write_expert_profile(dst, layers, experts)
 
 
 def read_json(path: Path) -> dict:
@@ -3155,6 +3214,94 @@ def pack_source(pack: Path):
     return m.group(1) if m else None
 
 
+def glm_shard_dir(cfg: dict, pack) -> Path:
+    """The folder a GLM pack's GGUF files are in: the one its config names (MNTQ_GLM_SHARD_DIR - a GLM pack sits beside
+    the other models' packs, under models_cfg/packs, not with the model files), else beside the pack (the layout an
+    earlier version wrote).  The same choice the engine makes (src/core/glm_model.cu, pack_shard_dir)."""
+    named = N.lookup(cfg.get("env") or {}, "MNTQ_GLM_SHARD_DIR")
+    return Path(named) if named else Path(pack).parent
+
+
+def glm_pack_home(cfg: dict, cfg_path: Path) -> Path:
+    """Where a GLM pack belongs now: beside the other models' packs, models_cfg/packs/<the model's name>, named after
+    the GGUF file the config names (glm_model_name - as a Qwen pack and a model of the user's own are); a config with no
+    GGUF of its own (an EXL3 folder) keeps its quant's short name."""
+    inst = cfg.get("installer") or {}
+    return ROOT / "models_cfg" / "packs" / (
+        glm_model_name(inst.get("gguf"))
+        or str(inst.get("quant") or cfg_path.stem.removeprefix("mntq-")).lower())
+
+
+def migrate_glm_pack(cfg: dict, cfg_path: Path) -> bool:
+    """A GLM config's pack is moved to where it belongs now: beside the other models' packs, models_cfg/packs/<the
+    model's name> - from beside the GGUF files (the layout before, where the engine found the shards at <pack>/..), or
+    from the short quant id an earlier setup named it by.  The config's --glm-pack, its tokenizer and MNTQ_GLM_SHARD_DIR
+    (the folder the GGUF files stay in) are pointed at it, once - so an installed config becomes like a Qwen one's
+    without setting up again.  True when `cfg` changed."""
+    if config_family(cfg) != "glm":
+        return False
+    args = cfg.get("args") or []
+    if "--glm-pack" not in args[:-1]:
+        return False                                   # (no pack: Metal / the CPU engine)
+    old = Path(flag_value(args, "--glm-pack"))
+    named = N.lookup(cfg.get("env") or {}, "MNTQ_GLM_SHARD_DIR")
+    new = glm_pack_home(cfg, cfg_path)
+    if old.resolve() == new.resolve() or new.exists():
+        return False                                   # (already where it belongs, or something else has that name)
+    if not old.is_dir() or pack_source(old) is None:
+        return False                                   # (no pack there to move: the setup builds one in place)
+    shards = Path(named) if named else old.parent
+    new.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(old), str(new))
+    except OSError as e:
+        warn(f"{cfg_path.name}: the pack could not be moved to {new} ({e}); it stays in {old}")
+        return False
+    args[args.index("--glm-pack") + 1] = str(new)
+    if Path(cfg.get("tokenizer") or "").parent == old:      # (the pack holds the tokenizer: it moved with it)
+        cfg["tokenizer"] = str(new / "tokenizer")
+    cfg["env"] = {**(cfg.get("env") or {}), "MNTQ_GLM_SHARD_DIR": str(shards)}
+    ok(f"{cfg_path.name}: the pack moved to {new}; the GGUF files stay in {shards}")
+    return True
+
+
+def migrate_glm_profile(cfg: dict, cfg_path: Path) -> bool:
+    """A GLM config's expert profile is kept inside its pack now (<pack>/expert-profile.bin, as a qwen35moe pack's and
+    DeepSeek's are), not beside the configs (models_cfg/expert-profile-glm.bin, where an earlier setup wrote it and a
+    start kept rewriting it).  A config that still names a file of its own outside the pack has that file moved in, and
+    both --expert-profile and --expert-profile-save are pointed at the pack's file - so an installed config becomes like
+    a Qwen one's without setting up again.  True when `cfg` changed."""
+    if config_family(cfg) != "glm":
+        return False
+    args = cfg.get("args") or []
+    pack = flag_value(args, "--glm-pack")              # (Metal / the CPU engine: no pack, the shipped file stays)
+    if pack is None:
+        return False
+    pack = Path(pack)
+    dst = pack / "expert-profile.bin"
+    old = flag_value(args, "--expert-profile")
+    if old and Path(old).resolve() != dst.resolve() and Path(old).is_file() and not dst.exists():
+        try:
+            shutil.move(str(old), str(dst))
+            ok(f"{cfg_path.name}: the expert profile moved into the pack ({dst})")
+        except OSError as e:
+            warn(f"{cfg_path.name}: the expert profile could not be moved to {dst} ({e}); it stays in {old}")
+            return False
+    prof = glm_expert_profile(pack)
+    if not prof.is_file():
+        return False
+    changed = False
+    for flag in ("--expert-profile", "--expert-profile-save"):
+        if flag in args[:-1]:
+            if args[args.index(flag) + 1] != str(prof):
+                args[args.index(flag) + 1] = str(prof)
+                changed = True
+        else:
+            args += [flag, str(prof)]
+            changed = True
+    return changed
+
+
 PACK_SOURCES = "sources.json"                      # in a pack: its model files' sizes and times when it was built
 
 
@@ -3217,29 +3364,6 @@ def check_sha256(shards: list, quant: str | None) -> None:
                  f"let the download finish, or delete the file and run {ME} --download-model")
 
 
-def metal_tokenizer_step(a, d: Path, shards: list, quant: str) -> Path:
-    """Step 6 on Metal (and on the CPU engine): the engine reads the GGUF files itself (no pack), the server needs the
-    tokenizer and the chat template, exported from the first shard into <model folder>/metal (or /cpu)/tokenizer
-    (tools/strata_tokenizer.py)."""
-    where = "cpu" if getattr(a, "backend", None) == "cpu" else "metal"
-    step(6, f"the tokenizer ({'The CPU engine' if where == 'cpu' else 'Metal'} reads the GGUF files itself: no pack)")
-    check_sha256(shards, quant)
-    out = d / where
-    vocab = out / "tokenizer" / "vocab.json"
-    if not a.repack and vocab.exists() and vocab.stat().st_mtime >= shards[0].stat().st_mtime:
-        ok(f"tokenizer already exported: {vocab.parent}")
-        return out
-    if not os.access(d, os.W_OK):
-        fail(f"{d} is not writable: the tokenizer is written next to the GGUF files", "pass --gguf-dir with a writable folder")
-    r = run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]), "--out", str(out)],
-            check=False)
-    if r.returncode != 0 or not vocab.exists():
-        fail(f"the tokenizer could not be exported from {shards[0].name}", "the reason is in the messages above (the "
-             "first file of a GLM-5.3-Flash GGUF carries its tokenizer)")
-    ok(f"tokenizer: {vocab.parent}")
-    return out
-
-
 def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
     if quant is not None and is_exl3(quant):
@@ -3250,11 +3374,23 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
         put_template(pack, body)
         ok(f"chat template: {label.replace('the base model', 'GLM-5')}")
         return pack
-    # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
-    # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
-    pack = d / "pack"
-    if pack_source(pack) not in (None, shards[0].name):
-        pack = d / f"pack-{quant_of(shards[0])}".lower()
+    # the pack lives beside the other models' packs (models_cfg/packs/<model>), as Qwen's and a model of the user's own
+    # does; the engine reads the GGUF shards from their own folder through MNTQ_GLM_SHARD_DIR (write_config sets it to
+    # that folder - src/core/glm_model.cu, pack_shard_dir), so the pack no longer has to sit next to them.  A pack an
+    # earlier version built beside the files (pack/, or pack-<model>/ when pack/ indexed another model of the same
+    # folder) is moved into place, once: it is the index of these same files, so nothing is built again.
+    name = glm_model_name(shards[0]) if shards else ""
+    pack = ROOT / "models_cfg" / "packs" / (name or (quant or quant_of(shards[0])).lower())
+    if pack_source(pack) != shards[0].name:
+        for old in (d / "pack", d / f"pack-{quant_of(shards[0])}".lower()):
+            if pack_source(old) == shards[0].name and not pack.exists():
+                pack.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(old), str(pack))
+                    ok(f"the pack moved beside the other models' packs: {pack}")
+                except OSError as e:
+                    warn(f"the pack could not be moved out of {old} ({e}): it is built again in {pack.parent}")
+                break
     if not a.repack and pack_source(pack) == shards[0].name and all((pack / f).exists() for f in PACK_FILES):
         why = pack_stale(pack, shards)
         if why is None:
@@ -3265,12 +3401,13 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
             return pack
         warn(f"the pack is built again: {why}")
     check_sha256(shards, quant)
-    if not os.access(d, os.W_OK):
-        fail(f"{d} is not writable: the pack is written next to the GGUF files (the engine finds them at <pack>/..)",
-             "link the .gguf files into a writable folder (" + ("mklink /H DIR\\<file> <file>, for each file" if WIN
-                                                                else "mkdir -p DIR && ln -s /path/to/*.gguf DIR/") +
-             ") and pass "
-             "--gguf-dir DIR")
+    try:
+        pack.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        fail(f"{pack.parent} cannot be made: the pack is written beside the configs (models_cfg/packs)", str(e))
+    if not os.access(pack.parent, os.W_OK):
+        fail(f"{pack.parent} is not writable: the pack is written beside the other models' packs (models_cfg/packs)",
+             f"make {ROOT / 'models_cfg'} writable, or run Mantiq from a folder you can write")
     say("  Writing the index of every tensor, the small float weights (about 1 GB) and the tokenizer; the experts")
     say("  stay in the GGUF files (a few minutes) ...")
     env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
@@ -3614,7 +3751,8 @@ def glm_sampling(choice: tuple | None, quant: str) -> dict:
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None,
+                 shards_dir: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 7711
     metal = is_ggml_engine(pc.get("backend"))   # Metal or the CPU engine: ggml reads the GGUF files itself
@@ -3636,15 +3774,34 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "lib_dirs": meta.get("lib_dirs") or [], "port": port}
     if MODELS.get(quant, {}).get("kv") and not metal:   # a quant with its own KV format (GLM Mantiq-XS: int8)
         cfg["args"] += ["--kv", MODELS[quant]["kv"]]
-    if metal:                      # ggml reads the GGUF files itself: no pack, no expert cache / prefill / KV streaming
-        # the learned expert profile (read at start when it is there, rewritten after each request) lives with the
-        # tokenizer, in <model folder>/metal (or /cpu)/; a setup again keeps it (keep_args)
+    # the expert profile both engines read and write, kept inside the pack (<pack>/expert-profile.bin, as a qwen35moe
+    # pack's and DeepSeek's are): --expert-profile names it and --expert-profile-save rewrites it after each request -
+    # the CPU engine reads {save, profile} and the CUDA one the same, so a start reads back what the last request
+    # learned.  glm_expert_profile seeds a pack with no profile of its own from the shipped family ranking
+    # (models_cfg/expert-profile-glm.bin) when it is of this pack's geometry; a pack it does not fit (a pruned model -
+    # RCO-152E keeps 152 a layer) starts from an empty interleaved one and learns this PC's routing, because the engine
+    # refuses a profile of another size.
+    prof = glm_expert_profile(pack)
+    if metal:                      # ggml reads the GGUF files itself: no pack to load, no expert cache / prefill / KV streaming
+        # its pack is the same one the CUDA / HIP engine loads (models_cfg/packs/<model>): the tokenizer the server
+        # reads, and this profile - seeded from the pack's own routing table and rewritten after each request, so a
+        # start reads back what the last request learned.  ggml_expert_profile replaces a file that is only its header
+        # (24 bytes), which the engine would otherwise rewrite as an empty order after every request
+        prof = ggml_expert_profile(gguf, pack / "expert-profile.bin") or prof
         cfg["args"] = ["--gguf", str(gguf), "--max-context", str(ctx),
-                       "--expert-profile-save", str(pack / "expert-profile.bin")]
+                       "--expert-profile", str(prof), "--expert-profile-save", str(prof)]
         cfg["backend"] = pc.get("backend")
+    else:                          # the CUDA/HIP engine reads and writes the same learned profile
+        cfg["args"] += ["--expert-profile", str(prof), "--expert-profile-save", str(prof)]
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
+    if shards_dir is not None and not metal:
+        # the pack the CUDA/HIP engine loads (--glm-pack) sits beside the other models' packs under models_cfg/packs,
+        # while the GGUF files it indexes stay in their own folder (the user's, or Mantiq's models folder).  The engine
+        # reads those shards from the folder this names (src/core/glm_model.cu, pack_shard_dir: STRATA_GLM_SHARD_DIR over
+        # its pack/.. default); written as MNTQ_GLM_SHARD_DIR and both names go to the engine's process (#686).
+        env["MNTQ_GLM_SHARD_DIR"] = str(shards_dir)
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
@@ -3683,7 +3840,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if env:
         cfg["env"] = env
     suffix = {"hip": "-hip", "metal": "-metal", "cpu": "-cpu"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"mntq-{quant.lower()}{suffix}.json"
+    # the config lives beside the other models' (models_cfg), as Qwen's and the models of the user's own do, and is
+    # named after the model: the GGUF file's own name (glm_model_name), else the quant's short id (an EXL3 folder)
+    cfg_path = ROOT / "models_cfg" / f"mntq-{glm_model_name(gguf) or quant.lower()}{suffix}.json"
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
@@ -3696,10 +3855,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["log"] = str(ROOT / f"{cfg_path.stem}.log")   # (the logs sit beside mntq.py, as the other models' configs do)
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
-    if PROFILE.exists() and profile_fits(pack):
-        cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = old_cfg.get("args") or []
         kept = keep_args(old, cfg["args"],
@@ -3741,6 +3898,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            (": " + ", ".join(f"{k}={v}" for k, v in cal["settings"].items()) if cal.get("settings") else ""))
         if cal.get("context"):
             ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)   # (models_cfg: a first setup on a machine that has none yet)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -3832,26 +3990,26 @@ def profile_experts(path) -> int | None:
     return experts if magic == b"STRP" else None
 
 
-def profile_fits(pack) -> bool:
-    """Whether the shipped expert profile is for this pack's model: it ranks the full model's experts (288 a layer), and
-    the engine refuses one of another size ("a profile for a different artifact") - a pruned model (RCO-152E keeps
-    152) starts without a profile and learns this PC's routing.  True where either size is unknown."""
-    have, ranked = pack_expert_count(pack), profile_experts(PROFILE)
-    return have is None or ranked is None or have == ranked
-
-
 def add_profile(cfg: dict) -> bool:
-    """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
-    would write it: an update restarts the installed config without setting up again.  Not a pruned model's (its
-    experts are not the profile's).  True when `cfg` changed."""
+    """A config with no --expert-profile (written before setup passed one) gets its profile, as a setup would write
+    it: an update restarts the installed config without setting up again.  A pack config takes its pack's profile;
+    a --gguf one (Metal / the CPU engine, which read the model file itself and have no pack) has its model's own
+    interleaved profile written where its --expert-profile-save looks for it, so the engine reads a ranking at load
+    instead of rewriting an empty order (a 24-byte file) after every request.  True when `cfg` changed."""
     args = cfg.get("args")
     if (not isinstance(args, list) or not any(f in args[:-1] for f in ("--glm-pack", "--gguf"))
-            or "--expert-profile" in args or not PROFILE.exists()):
+            or "--expert-profile" in args):
         return False
     pack = flag_value(args, "--glm-pack")              # (a Metal config has no pack: --gguf names the model file)
-    if pack is not None and not profile_fits(pack):
+    if pack is not None:
+        prof = glm_expert_profile(Path(pack))
+    else:
+        save = flag_value(args, "--expert-profile-save")
+        gguf = flag_value(args, "--gguf")
+        prof = ggml_expert_profile(Path(gguf), Path(save)) if save and gguf else None
+    if prof is None or not prof.is_file():
         return False
-    args += ["--expert-profile", str(PROFILE)]
+    args += ["--expert-profile", str(prof)]
     return True
 
 
@@ -3889,8 +4047,12 @@ def keep_profile(old: list, new: list) -> list:
     shipped one only when it is another file that still exists (a moved or deleted one falls back to the shipped
     profile).  `new` is changed in place; what was kept is returned."""
     mine, shipped = flag_value(old, "--expert-profile"), flag_value(new, "--expert-profile")
-    if not mine or mine == shipped or Path(mine).name == PROFILE.name or not Path(mine).exists():
+    if not mine or mine == shipped or not Path(mine).exists():
         return []                                         # (the shipped one, or another copy's own)
+    # a GLM profile now lives in the pack and is named expert-profile.bin there (as a Qwen pack's and DeepSeek's are),
+    # so the old file itself (PROFILE.name, beside the configs) and any pack's own default are not "wired in by hand"
+    if Path(mine).name in (PROFILE.name, "expert-profile.bin"):
+        return []
     if shipped is not None:
         new[new.index("--expert-profile") + 1] = mine
     else:
@@ -4595,6 +4757,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     if renamed:
         ok(f"{cfg_path.name}: the programs are named after Mantiq now ({Path(cfg['exe']).name})")
+    if migrate_glm_pack(cfg, cfg_path):                # (a pack from the layout before, beside the GGUF files)
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if migrate_glm_profile(cfg, cfg_path):             # (a profile from the layout before, beside the configs)
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
         set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
@@ -4623,21 +4789,24 @@ def server_command(cfg_path: Path, a) -> tuple:
             if not s.exists():
                 fail(f"{cfg_path.name}: the model's file {s.name} is missing ({s.parent})", f"run {ME} --setup to repair it")
     src = None if metal else pack_source(pack)
-    if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
-        why = pack_stale(pack, shard_set(pack.parent / src))
+    # a GLM pack sits beside the other models' packs (models_cfg/packs) while its GGUF files stay in their own folder
+    # (glm_shard_dir reads MNTQ_GLM_SHARD_DIR from the config); every other family keeps its pack beside its files
+    shard_dir = glm_shard_dir(cfg, pack) if config_family(cfg) == "glm" else pack.parent
+    if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(shard_dir / src)):
+        why = pack_stale(pack, shard_set(shard_dir / src))
         if why is not None:
             fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
                  f"run {ME} --setup --repack to build it again (a few minutes)")
         if not (pack / PACK_SOURCES).exists():
-            stamp_pack(pack, shard_set(pack.parent / src))
+            stamp_pack(pack, shard_set(shard_dir / src))
     if add_profile(cfg):                               # a config written before the expert profile (an update)
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        ok(f"{cfg_path.name}: starts from the expert profile now")
     stale = stale_tuning(cfg)                          # tuned before a driver / P2P change: measured again (#419)
     if stale is not None:
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         if stale:
             warn(f"{cfg_path.name}: {stale}")
-        ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
     if ds4 and ds4_seed_profile(cfg):                  # (DeepSeek's: a pack that has not learned one yet)
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
@@ -5069,7 +5238,8 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         args = cfg.get("args") or []
         pack = next((Path(args[args.index(k) + 1]) for k in ("--glm-pack", "--pack") if k in args[:-1]), None)
         ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else "?"
-        d = pack.parent if pack else None
+        # the GGUF files (a GLM pack's shards) live in their own folder, not beside the pack (models_cfg/packs)
+        d = (glm_shard_dir(cfg, pack) if config_family(cfg) == "glm" else pack.parent) if pack else None
         if config_family(cfg) == "deepseek":   # (mntq-ds4 runs its vision tower itself: on unless --vision off, #416)
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
         elif config_family(cfg) == "minimax":   # (mntq-mm3's too: --vision on when the pack has it, left out without)
@@ -5365,9 +5535,13 @@ def set_up(a, prev: dict) -> Path | None:
         return None
     d, shards, quant = got
     dflash = drafter_step(models) if draft == "dflash2" else None
-    pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
+    # 6: the pack every engine reads its model through - models_cfg/packs/<the model>, the same files whether the
+    # CUDA / HIP engine loads it (--glm-pack) or the CPU / Metal one reads the GGUF files themselves and takes only
+    # its tokenizer and its expert-profile.bin from there
+    pack = pack_step(a, d, shards, llama, quant)
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash,
+                            shards[0], d)   # 8   (gguf: the model's first file - Metal runs it, every engine names the config after it)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: here the choice is yours)
         ok("DFlash2 drafts on the " + ("CPU engine" if pc["backend"] == "cpu" else "Mac") +
            ", not measured against the MTP block (both are exact): "
@@ -7146,6 +7320,18 @@ def gguf_quant_name(src: Path) -> str:
     return found[-1].lower() if found else "gguf"
 
 
+def glm_model_name(first) -> str:
+    """The name a GLM model is known by, from its GGUF file: the file's own name read back with its quant
+    (model_file_stem), less the split's -00001-of-0000N part - so GLM-5.3-Flash-Maya-XS-IQ1_S-00001-of-00002.gguf reads
+    "GLM 5.3 Flash Maya XS IQ1_S", and a GLM config and its pack are named like a Qwen one's (not the short quant id the
+    setup used to write, mntq-mantiq-xs-iq1_s).  "" for a model that is no GGUF file (an EXL3 folder keeps its quant's
+    own name)."""
+    p = Path(first) if first else Path("")
+    if p.suffix.lower() != ".gguf":
+        return ""
+    return model_file_stem(p.with_name(SHARD_RE.sub(".gguf", p.name)))
+
+
 def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp: bool = True) -> Path:
     """tools/iq_pack.py's pack in <model>/pack (the index of every tensor, the small float weights, the tokenizer with
     the GGUF's chat template); with mtp, also the MTP drafter built from the GGUF's NextN block (<pack>/mtp,
@@ -7661,13 +7847,14 @@ def add_model_setup(a) -> Path:
 
 
 def add_glm_model_flow(a, src: Path) -> Path | None:
-    """A GLM-5.3-Flash GGUF file of the user's own (glm5-next): its pack, beside the model files (pack_step uses a
-    pack/ that already indexes these files as it is), and the config write_config writes (mntq-<quant>.json), so the
-    model is offered with the others on the next start.  The engine settings this PC's own GLM config carries - its
-    VRAM reserve, KV format, expert cache and environment - stay for the new model too."""
+    """A GLM-5.3-Flash GGUF file of the user's own (glm5-next): its pack, under models_cfg/packs beside the other
+    models' packs (the GGUF files stay where they are; pack_step uses a pack that already indexes them as it is), and
+    the config write_config writes (models_cfg/mntq-<the model's name>.json, from the GGUF file), so the model is
+    offered with the others on the next start.  The engine settings this PC's own GLM config carries - its VRAM reserve,
+    KV format, expert cache and environment - stay for the new model too."""
     files = gguf_shards(src)
     quant = quant_of(files[0])
-    cfg_path = ROOT / f"mntq-{quant.lower()}.json"
+    cfg_path = ROOT / "models_cfg" / f"mntq-{glm_model_name(files[0]) or quant.lower()}.json"
     if cfg_path.exists():
         ok(f"{cfg_path.name} is already in the list: nothing was added")
         return cfg_path
@@ -7676,10 +7863,9 @@ def add_glm_model_flow(a, src: Path) -> Path | None:
     llama = add_model_setup(a)                       # (llama.cpp's gguf-py for the pack, and the engine to run it)
     pc = check_pc(a, "glm")
     d = files[0].parent
-    pack = (metal_tokenizer_step(a, d, files, quant) if is_ggml_engine(pc.get("backend"))
-            else pack_step(a, d, files, llama, quant))
+    pack = pack_step(a, d, files, llama, quant)     # (the pack every engine reads the model through)
     cfg_path = write_config(a, pc, read_json(STAMP), pack, quant, ctx, d, None,
-                            ("local", files[0]), None, files[0])
+                            ("local", files[0]), None, files[0], d)
     cfg = read_json(cfg_path)
     metal = is_ggml_engine(pc.get("backend"))
     kept = [] if metal else keep_args(prev.get("args") or [], cfg["args"],
@@ -7740,32 +7926,26 @@ def add_model_flow(a) -> Path | None:
     metal = is_ggml_engine(a.backend) or is_ggml_engine(prev.get("backend"))
     mtp = False
     say()
+    # the pack is built for every engine - models_cfg/packs/<the model>: the CUDA / HIP engine loads it (--pack) while
+    # the ggml one reads the GGUF file itself and takes the pack's tokenizer and its expert-profile.bin, so one model's
+    # files are the same whichever engine serves it
+    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    say(f"  Building the pack of {src.name} in {pack} (a few minutes) ...")
+    run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
+         "--compat-bf16"], env=env)
+    missing = [f for f in PACK_FILES if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     if metal:
-        # ggml reads the GGUF itself (as write_config's metal branch): no pack, so the pack builder's numpy and
-        # gguf-py are not needed at all - but the server still needs the tokenizer and the chat template, exported
-        # from the file itself as the setup's step 6 does (the pack folder is only where they sit).
-        say(f"  The tokenizer of {src.name} (the engine reads the GGUF file itself: no pack) ...")
-        tok = pack / "tokenizer"
-        if not (tok / "vocab.json").exists():
-            pack.mkdir(parents=True, exist_ok=True)
-            r = run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(files[0]),
-                     "--out", str(pack)], check=False)
-            if r.returncode != 0 or not (tok / "vocab.json").exists():
-                fail(f"the tokenizer could not be exported from {files[0].name}", "the reason is in the messages above")
-        # ggml reads the GGUF itself (as write_config's metal branch): no pack, no CUDA drafter / expert-cache flags.
+        # ggml reads the GGUF file itself (as write_config's metal branch): none of the CUDA / HIP engine's flags.
+        # Its profile is the pack's own, seeded from the routing table its native_experts.txt records (just written) -
+        # without one --expert-profile-save would rewrite an empty order after every request
         args = ["--gguf", str(files[0]), "--max-context", str(ctx),
                 "--expert-profile-save", str(pack / "expert-profile.bin")]
-        prof = qwen_expert_profile(pack)
+        prof = qwen_expert_profile(pack) or ggml_expert_profile(files[0], pack / "expert-profile.bin")
         if prof:
             args += ["--expert-profile", str(prof)]
     else:
-        env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
-        say(f"  Building the pack of {src.name} in {pack} (a few minutes) ...")
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
-             "--compat-bf16"], env=env)
-        missing = [f for f in PACK_FILES if not (pack / f).exists()]
-        if missing:
-            fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
         mtp = gguf_has_mtp(mtp_shard(files))
         if mtp:
             say("  The MTP drafter from the model's NextN block (a few minutes) ...")
@@ -7825,9 +8005,11 @@ def add_model_flow(a) -> Path | None:
 
 def normalize_model_names() -> None:
     """Give a model of the user's own the name the model itself carries: mntq-<its own name> <QUANT>.json, as
-    add_model_flow writes it - not the short form an earlier list used.  A config that already carries that name is
-    left alone, and so is one whose name another file holds; the config's own log and its .prev move with it, and its
-    start script is written again under the new name (only when one was there)."""
+    add_model_flow writes it - not the short form an earlier list used.  A GLM config is named after its GGUF file too
+    (glm_model_name: the short quant id mntq-mantiq-xs-iq1_s an earlier setup wrote becomes mntq-<the model's name>).
+    A config that already carries that name is left alone, and so is one whose name another file holds; the config's
+    own log and its .prev move with it, and its start script is written again under the new name (only when one was
+    there)."""
     folder = ROOT / "models_cfg"
     if not folder.is_dir():
         return
@@ -7838,7 +8020,9 @@ def normalize_model_names() -> None:
         gguf = (cfg.get("installer") or {}).get("gguf")
         if not gguf:                                   # (the published models' own configs keep the names they had)
             continue
-        new = old.with_name(f"mntq-{model_file_stem(gguf)}.json")
+        # a GLM config is named after its GGUF file too (glm_model_name leaves the split's -00001-of-0000N off)
+        name = glm_model_name(gguf) if config_family(cfg) == "glm" else model_file_stem(gguf)
+        new = old.with_name(f"mntq-{name}.json")
         if new.name == old.name:
             continue
         if new.exists():

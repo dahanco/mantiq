@@ -6644,12 +6644,14 @@ def main() -> int:
         svc.savings = savings.Ledger(savings.ledger_path(p), p.name, svc.model, models.quant_label(cfg, p))
         threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
-    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
-    if flag:                                            # the model's folder: the parent of the pack or GGUF file
-        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
+    if "--glm-pack" in args[:-1]:                       # (a GLM pack sits apart from its GGUF files: models_cfg/packs)
+        svc.model_dir = models.shard_dir_of(cfg).resolve()
+    elif "--gguf" in args[:-1]:                         # (Metal: the first GGUF file, no pack - the model's folder)
+        svc.model_dir = Path(args[args.index("--gguf") + 1]).resolve().parent
+    if svc.model_dir:                                   # the model's folder: its first GGUF's header is read from it
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
+    if "--pack" in args[:-1]:                           # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
         svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
         # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack

@@ -132,6 +132,17 @@ def pack_of(cfg: dict) -> Path | None:
     return None
 
 
+def shard_dir_of(cfg: dict) -> Path | None:
+    """The folder a config's model files (the GGUF shards) are in.  A GLM pack sits beside the other models' packs,
+    under models_cfg/packs, while its GGUF files stay in their own folder, which its "env" names (MNTQ_GLM_SHARD_DIR -
+    the engine reads it too, src/core/glm_model.cu); every other family keeps its pack beside its files."""
+    pack = pack_of(cfg)
+    if pack is None:
+        return None
+    named = mntq_names.lookup(cfg.get("env") or {}, "MNTQ_GLM_SHARD_DIR")
+    return Path(named) if named else pack.parent
+
+
 # ------------------------------------------------------------------ the context a model was trained for
 def trained_context(model_dir) -> int | None:
     """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
@@ -169,11 +180,12 @@ _trained: dict = {}
 
 
 def trained_context_of(cfg: dict) -> int | None:
-    """A config's model's trained context, as the server reads it when it runs that config (GLM: its GGUF header
-    beside --glm-pack; DeepSeek and MiniMax: --pack's own file); kept once found (a header read is not free)."""
+    """A config's model's trained context, as the server reads it when it runs that config (GLM: its first GGUF's
+    header, in the folder its "env" names, not beside --glm-pack; DeepSeek and MiniMax: --pack's own file); kept once
+    found (a header read is not free)."""
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:
-        key, read_it = ("gguf", str(Path(args[args.index("--glm-pack") + 1]).resolve().parent)), trained_context
+        key, read_it = ("gguf", str(shard_dir_of(cfg).resolve())), trained_context   # (the GGUF folder, not the pack's)
     elif "--pack" in args[:-1]:
         key, read_it = ("pack", args[args.index("--pack") + 1]), trained_context_ds4
     else:
@@ -615,12 +627,13 @@ def write(path: Path, cfg: dict):
     os.replace(tmp, p)
 
 
-def folder_size(pack: Path | None) -> int | None:
-    """The model's files: its folder's (the GGUF shards beside the pack) and the pack's, one level each."""
+def folder_size(pack: Path | None, model_dir: Path | None = None) -> int | None:
+    """The model's files: its GGUF folder and its pack, one level each.  A GLM pack sits apart from its files
+    (models_cfg/packs), so the folder its config names comes in as `model_dir`; else it is the pack's own."""
     if pack is None:
         return None
     total = 0
-    for d in (pack.parent, pack):
+    for d in (model_dir or pack.parent, pack):
         try:
             with os.scandir(d) as it:
                 for e in it:
@@ -646,7 +659,7 @@ def missing(cfg: dict) -> str | None:
     if not cfg.get("exe") or pack is None:
         return "its engine or pack is not set"
     if not pack.is_dir():
-        return f"its model files are not on this PC ({pack.parent})"
+        return f"its model files are not on this PC ({shard_dir_of(cfg)})"
     return None
 
 
@@ -668,8 +681,8 @@ def describe(path: Path, running: str | None) -> dict:
             "model_label": mntq_quants.config_label(cfg),   # (the model as users see it: "Qwopus3.6 ... Hermes · Q8_0")
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
-            "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
-            "size": folder_size(pack), "ok": why is None, "missing": why,
+            "port": cfg.get("port"), "script": script, "folder": str(shard_dir_of(cfg)) if pack else None,
+            "size": folder_size(pack, shard_dir_of(cfg)), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
                                                                                                        CONTEXTS),
@@ -921,9 +934,10 @@ def vision_files(cfg: dict) -> list:
     return out
 
 
-def pack_shards(pack: Path) -> list:
-    """The model files a pack indexes, in its folder: its sources.json's list, else the GGUF its native_experts.txt
-    names (every part of a split one)."""
+def pack_shards(pack: Path, model_dir: Path | None = None) -> list:
+    """The model files a pack indexes, in their folder (a GLM pack sits apart from its files: `model_dir` is that
+    folder, the pack's own when not given): its sources.json's list, else the GGUF its native_experts.txt names (every
+    part of a split one)."""
     names = []
     try:
         rec = json.loads((pack / "sources.json").read_text(encoding="utf-8")).get("files") or []
@@ -940,14 +954,14 @@ def pack_shards(pack: Path) -> list:
         part = GGUF_PART.match(first) if first else None
         names = ([f"{part.group(1)}-{i:05d}-of-{part.group(3)}.gguf" for i in range(1, int(part.group(3)) + 1)]
                  if part else [first] if first else [])
-    return [pack.parent / Path(n).name for n in names]   # (by name: nothing outside the pack's folder)
+    return [(model_dir or pack.parent) / Path(n).name for n in names]   # (by name: nothing outside the model's folder)
 
 
 def runs_from(cfg: dict) -> list:
     """Every path a config runs from: its pack and the model files in it, its drafter, image encoder and tokenizer, and
     the folder or GGUF its setup named."""
     pack = pack_of(cfg)
-    found = ([pack] + pack_shards(pack)) if pack else []
+    found = ([pack] + pack_shards(pack, shard_dir_of(cfg))) if pack else []
     inst = cfg.get("installer") or {}
     found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
     found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
@@ -1003,7 +1017,7 @@ def delete_plan(root: Path, path: Path) -> dict:
     me = _res(path)
     others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
     refs = [r for _, c in others for r in runs_from(c)]
-    homes = [h.parent for h in (_res(pack_of(c)) for _, c in others) if h is not None]   # (their folders: links in them)
+    homes = [h for h in (_res(shard_dir_of(c)) for _, c in others) if h is not None]   # (their folders: links in them)
     out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
            "vision": False, "drafter": None, "drafter_users": [], "kept": []}
     models = _res((cfg.get("installer") or {}).get("models_dir"))
@@ -1011,7 +1025,7 @@ def delete_plan(root: Path, path: Path) -> dict:
     if models is None or pack is None:
         out["why"] = "Mantiq's setup did not download this model's files, so it does not know which ones are its own"
         return out
-    folder = pack.parent
+    folder = _res(shard_dir_of(cfg))
     out["folder"] = str(folder)
     project = _res(Path(root))
     items: list = []
@@ -1034,11 +1048,15 @@ def delete_plan(root: Path, path: Path) -> dict:
         if not shared(pack):
             add(pack, "pack")
         if downloaded:
-            for f in pack_shards(pack):
+            for f in pack_shards(pack, folder):
                 if not shared(f):
                     add(f, "gguf")
         else:
             out["kept"].append(f"Your own model files in {folder} stay; only the pack Mantiq built from them goes.")
+    # a GLM pack sits beside the other models' packs (models_cfg/packs), apart from its files: the folder above does
+    # not hold it, so it is added on its own (it is still Mantiq's, built from these files, and goes with them)
+    if not _within(pack, folder) and not shared(pack):
+        add(pack, "pack")
     for v in map(_res, vision_files(cfg)):
         if v is not None and _within(v, models) and not shared(v):
             add(v, "vision")

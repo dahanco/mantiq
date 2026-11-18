@@ -1555,17 +1555,24 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
-        // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
+        // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below.
+        // A profile the first run has not written yet is not an error - the run starts from the pack's own order and
+        // --expert-profile-save writes this machine's once a request has run (the CPU engine reads the same way);
+        // a file that is there and unreadable stays an error.
         if (!profile_path_.empty() && profile_.empty()) {
             int64_t pslots = 0;
             std::string perr;
-            if (!read_expert_profile(profile_path_, profile_layers(), g.n_expert, profile_, pslots, perr)) {
+            if (read_expert_profile(profile_path_, profile_layers(), g.n_expert, profile_, pslots, perr)) {
+                if (l0_ == 0)
+                    std::fprintf(stderr, "glm fast: the expert profile %s ranks %zu (layer, expert) pairs\n",
+                                 profile_path_.c_str(), profile_.size());
+            } else if (std::ifstream(profile_path_, std::ios::binary).good()) {
                 err = "glm fast: --expert-profile: " + perr;
                 return false;
+            } else if (l0_ == 0) {
+                std::fprintf(stderr, "glm fast: no expert profile yet at %s: starting from the pack's order\n",
+                             profile_path_.c_str());
             }
-            if (l0_ == 0)
-                std::fprintf(stderr, "glm fast: the expert profile %s ranks %zu (layer, expert) pairs\n",
-                             profile_path_.c_str(), profile_.size());
         }
         // the slots PER LAYER: uniform, or - with the expert profile, else the pack's expert_counts.txt
         // (tools/glm_expert_prior.py) - by routing share: every layer gets a floor, then each further slot goes to the

@@ -160,13 +160,21 @@ void mmvq_cols(int type, const void* weights, const uint8_t* xq, float* y, int n
     }
 }
 // A resident F16 projection: the weight column stride is n_in fp16 elements and the activation is F32 (not the
-// Q8_1 image), so this needs no chunking - the multi kernel is itself bounded at 8 rows per launch.
+// Q8_1 image), and the multi kernel is itself bounded at 8 rows per launch, so a WIDE window (the batched prompt
+// read, `--prompt-window` beyond 8) is applied in <=8-row chunks here as well.  The F32 activation is
+// COLUMN-MAJOR with a stride of n_in floats (`n_in` is even, and every weight row is `n_in` fp16 elements), so a
+// chunk covers exactly the rows one wide call would have read - every row gets the call it would have received
+// on its own.
 void f16_cols(const void* weights, const float* x, float* y, int n_in, int n_out, int ncols, void* cs) {
-    if (ncols == 1) {
-        strata::kernels::f16_gemv_fp32_mmvf(x, (const uint16_t*) weights, y, n_in, n_out, cs);
-        return;
+    for (int c = 0; c < ncols; c += kMmvqMaxCols) {
+        const int cn = std::min(kMmvqMaxCols, ncols - c);
+        if (cn == 1)
+            strata::kernels::f16_gemv_fp32_mmvf(x + (size_t) c * n_in, (const uint16_t*) weights,
+                                                y + (size_t) c * n_out, n_in, n_out, cs);
+        else
+            strata::kernels::f16_gemv_fp32_mmvf_multi(x + (size_t) c * n_in, n_in, (const uint16_t*) weights,
+                                                      y + (size_t) c * n_out, n_out, n_in, n_out, cn, cs);
     }
-    strata::kernels::f16_gemv_fp32_mmvf_multi(x, n_in, (const uint16_t*) weights, y, n_out, n_in, n_out, ncols, cs);
 }
 // ONE PROJECTION, EITHER FORM: the F32 activation `x` is always produced anyway (`mixed_`/`attn32_`), and the
 // Q8_1 image `xq` is what the quantized path reads.  Routing by the WEIGHT keeps the two column layouts in one

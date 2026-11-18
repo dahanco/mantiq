@@ -1110,8 +1110,12 @@ static int glm_pack_generate(const Options& o) {
     if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
     if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
-    // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
-    if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
+    // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other.
+    // The learned profile is the seed on the next start, so --expert-profile-save alone is enough (the CPU engine
+    // reads {expert_profile_save, expert_profile}): the first run starts from the pack's order and writes this
+    // machine's own after a request, and each start after that reads it back.
+    const std::string& seed = o.expert_profile.empty() ? o.expert_profile_save : o.expert_profile;
+    if (!seed.empty()) model.set_expert_profile(seed);
     if (!o.dump_routing.empty() && !strata::core::Glm5Model::set_routing_dump(o.dump_routing, err)) {
         std::fprintf(stderr, "mntq generate: --dump-routing: %s\n", err.c_str());
         return 1;
@@ -2199,6 +2203,20 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm follow: every request decodes the %zu tokens of %s (MNTQ_GLM_SPEC_FOLLOW)\n",
                      follow_ids.size(), fp);
     }
+    // #477 --expert-profile-save: what the expert tiers learned, saved after EVERY request ends (its DONE line is
+    // already out, so the client is not kept waiting) - the profile orders the next start's warm-up, exactly as the
+    // CPU engine's serve loop saves after each request.  The periodic check in the loop below is the safety net for a
+    // request that never returns, and QUIT saves once more.
+    Clock::time_point profile_saved_at = Clock::now();
+    const auto save_profile = [&](const char* why) {
+        if (o.expert_profile_save.empty() || !model.fast()) return;
+        std::string e;
+        if (model.save_expert_profile(o.expert_profile_save, e))
+            std::fprintf(stderr, "mntq serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(), why);
+        else
+            std::fprintf(stderr, "mntq serve: the expert profile was not saved: %s\n", e.c_str());
+        profile_saved_at = Clock::now();
+    };
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
@@ -2427,6 +2445,7 @@ static int glm_pack_generate(const Options& o) {
         if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
+        save_profile("request");   // and its expert profile, at the same moment (the CPU engine's serve loop)
         if (model.fast() && produced > 0) {
             const double n = (double) produced;
             std::fprintf(stderr,
@@ -2778,6 +2797,7 @@ static int glm_pack_generate(const Options& o) {
         }
         ctxs[(size_t) g.ctx].busy = deferred;   // (a deferred snapshot: busy until flush_pauses)
         ctxs[(size_t) g.ctx].used = ++ctx_clock;
+        save_profile("request");   // this request's end (DONE already out), as the serial path saves after each one
         g.done = true;
     };
     const auto gen_sweep = [&] {
@@ -4138,18 +4158,6 @@ static int glm_pack_generate(const Options& o) {
     // tokens take no positions of their own: the rows only replace the embeddings)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
-    // #477 --expert-profile-save: what the expert tiers learned, every --expert-profile-save-every minutes before the
-    // next request (a prompt's lent slots are back by then) and after the last one
-    Clock::time_point profile_saved_at = Clock::now();
-    const auto save_profile = [&](const char* why) {
-        if (o.expert_profile_save.empty() || !model.fast()) return;
-        std::string e;
-        if (model.save_expert_profile(o.expert_profile_save, e))
-            std::fprintf(stderr, "mntq serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(), why);
-        else
-            std::fprintf(stderr, "mntq serve: the expert profile was not saved: %s\n", e.c_str());
-        profile_saved_at = Clock::now();
-    };
     std::string line;
     for (;;) {
         if (multi && !pending.empty()) admit_pending();
@@ -4470,6 +4478,7 @@ static int glm_pack_generate(const Options& o) {
                 bind_ctx(c);
                 slot_put(" on shutdown");
             }
+        save_profile("quit");   // #477: the requests still running saved above; one final save has the last word
         return 0;
     }
     if (slot_keep && !slot_ram) slot_put(" on shutdown");
@@ -9625,6 +9634,28 @@ int main(int argc, char** argv) {
                     strata::core::progress_at("idle");
                 }
             };
+            // #477 (the Qwen path): what the VRAM expert tier learned, written as the profile the NEXT start's
+            // warm-up follows.  The CPU engine's serve loop saves after every request and so does the GLM pack's;
+            // this is the same moment - the request's DONE is already out, so the client is not kept waiting.
+            // The residency is the slot table itself, and the heat is the routing the decode counted per
+            // (layer, expert) (`drive.d.usage`, the counter --adapt-every/--adapt-swaps shares).
+            const auto save_profile = [&](const char* why) {
+                if (o.expert_profile_save.empty()) return;
+                const int64_t NL = g.n_layers, NE = g.n_expert;
+                std::vector<uint8_t> resident((size_t) (NL * NE), 0);
+                for (int64_t il = 0; il < NL; ++il)
+                    for (int64_t e = 0; e < NE; ++e)
+                        if (xcache.slot_of(il, e) != strata::core::kNotResident)
+                            resident[(size_t) (il * NE + e)] = 1;
+                const std::vector<double> heat(drive.d.usage.begin(), drive.d.usage.end());
+                std::string e;
+                if (strata::core::write_expert_profile(o.expert_profile_save, NL, NE,
+                        strata::core::rank_learned_profile(NL, NE, resident, heat, profile), e))
+                    std::fprintf(stderr, "mntq repl: expert profile saved to %s (%s)\n",
+                                 o.expert_profile_save.c_str(), why);
+                else
+                    std::fprintf(stderr, "mntq repl: the expert profile was not saved: %s\n", e.c_str());
+            };
             // The prompt the CLI was started with (`--tokens-file`, the `--repl` client's first message) is answered
             // by the decode loop ABOVE, before this block runs and before any `GEN` arrives.  The client is streaming
             // that answer right now, so hand it over here: the tokens it produced, then its DONE line, whose finish
@@ -9634,6 +9665,7 @@ int main(int argc, char** argv) {
                 std::printf("DONE %lld %s\n", (long long) produced.size(),
                             prompt_answer_stopped ? "stop" : "length");
                 std::fflush(stdout);
+                save_profile("request");   // the CLI prompt is the first request: its expert profile too
             }
             // `--serve` (serve/server.py, the main Mantiq UI): the handshake it waits for - the INFO facts the Monitor
             // shows, then READY - and a CLEAN start.  The CLI seeded a dummy prompt for `o.serve` (one token, one
@@ -9900,7 +9932,9 @@ int main(int argc, char** argv) {
                 else
                     std::printf("DONE %lld %s\n", (long long) n_out, finish);
                 std::fflush(stdout);
+                save_profile("request");   // this request's end (DONE already out), as the CPU/GLM serve loops save
             }
+            save_profile("quit");   // the profile the last request left, once more on the way out (#477)
             return 0;
         }
     }
