@@ -240,11 +240,11 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
     return result;
 }
 
-bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+bool GlmExpertHelper::compute(int gu_type, int up_type, int d_type, size_t down_off, float limit, int ne,
                               const int* keys, const float* weights, const float* x,
                               float* out, std::string& err) {
     namespace gf = strata::kernels::glmf;
-    if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
+    if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(up_type) || !gf::moe_supported(d_type)) {
         err = "GLM expert helper: unsupported expert types or route width";
         return false;
     }
@@ -275,7 +275,7 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
     if (prof_ && !check(cudaEventRecord(ev_[1], stream_), "helper profile event", err, device_)) return false;
     gf::quantize_q8_1(zero_copy_ ? x_z_ : x_, xq_, n_embd_, stream_);
     if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return false;
-    gf::moe_gate_up(gu_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
+    gf::moe_gate_up(gu_type, up_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
     if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return false;
     gf::moe_down(d_type, plan, ne, n_embd_, n_ff_, down_off, hq_, nullptr, zero_copy_ ? out_z_ : out_, stream_);
     if (prof_ && !check(cudaEventRecord(ev_[4], stream_), "helper profile event", err, device_)) return false;
@@ -578,7 +578,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     if (lay.native) {
         strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.up_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
         strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
     } else {

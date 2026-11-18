@@ -384,6 +384,30 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return __half2float(bq8_0->d) * __low2float(bq8_1->ds) * (float) sumi;
 }
 
+// Q4_0: 32 values per block (an fp16 scale and 32 nibbles) and two calls cover one block (VDR 2), each call
+// taking the low and the high nibbles of 16 values; the unsigned 0..15 codes' -8 offset is removed with the
+// activation's own sum (8 * VDR / QI4_0 = 4 per call).  An Apex file's NextN block (blk.40) keeps its routed
+// experts in this format.  vecdotq.cuh's vec_dot_q4_0_q8_1 and its _impl at the pinned commit.
+__device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q4_0* bq4_0 = (const block_q4_0*) vbq + kbx;
+    int v[2], u[2 * 2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        v[i] = get_int_b2(bq4_0->qs, iqs + i);
+        u[2 * i + 0] = get_int_b4(bq8_1->qs, iqs + i);
+        u[2 * i + 1] = get_int_b4(bq8_1->qs, iqs + i + QI4_0);
+    }
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        sumi = ggml_cuda_dp4a((v[i] >> 0) & 0x0F0F0F0F, u[2 * i + 0], sumi);
+        sumi = ggml_cuda_dp4a((v[i] >> 4) & 0x0F0F0F0F, u[2 * i + 1], sumi);
+    }
+    const float2 ds = __half22float2(bq8_1->ds);
+    return __half2float(bq4_0->d) * (sumi * ds.x - 4.0f * ds.y);   // 4.0f = 8 * VDR / QI4_0
+}
+
 // Q4_K: 256 values, 8 sub-blocks of 32 with 6-bit scales and mins; VDR 2.  Qwopus3.6-35B-A3B's routed gate/up
 // experts are Q4_K.  vecdotq.cuh's vec_dot_q4_K_q8_1 and its _impl_vmmq at the pinned commit (the branch-free
 // scale unpacking, the same shape as the Q5_K product above).
@@ -560,6 +584,8 @@ __device__ __forceinline__ float vec_dot_f16_q8_1(const void* __restrict__ v, co
 template<int TY> struct Fmt;
 template<> struct Fmt<1> { static constexpr int qk = 32, ipb = 1, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_f16_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<2> { static constexpr int qk = 32, ipb = 2, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<16> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -718,6 +744,31 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     for (int e = e0; e < e1; ++e) {
         const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
         if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+    }
+}
+
+// One role's gate/up product: rows 0..n_ff of the role's own matrix (role 0 gate at gu_row's stride, role 1 up at
+// up_row's).  The combined kernel above needs one shared type; a mixed-quant layer (gate_type != up_type) launches
+// this twice, once per role with its own type and row stride.
+template<int TY>
+__global__ void __launch_bounds__(256) native_gu_role_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_tok,
+                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                             int role, float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. n_ff
+    if (row >= L.n_ff) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = blob + (role ? L.up_off : 0) + (size_t) row * (role ? L.up_row : L.gu_row);
+    const int nb = (int) (L.n_embd / Fmt<TY>::qk), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; ++e) {
+        const float s = row_dot<TY>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+        if (lane == 0) out[(size_t) e * L.n_ff + row] = s;
     }
 }
 
@@ -1140,13 +1191,16 @@ __global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* 
     const int64_t i = blockIdx.x;
     dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x);
 }
-// gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
-__global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
-                                  __half* __restrict__ y) {
+// gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity.  The gate and up rows
+// may be different types (a mixed-quant layer), so each role decodes with its own (rows of both are n_embd wide, so
+// the block index `i` means the same on either side).
+__global__ void dequant_gu_kernel(int ty_gate, int ty_up, const void* __restrict__ gate, const void* __restrict__ up,
+                                  int64_t per_row, __half* __restrict__ y) {
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
-    dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
+    dq_dispatch<__half>(parity ? ty_up : ty_gate, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K,
+                        threadIdx.x);
 }
 
 bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
@@ -1247,23 +1301,26 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     check("iq_dequant_f32");
 }
 
-void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
+void iq_dequant_gu_f16(int gate_type, int up_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                       uint16_t* dst, void* stream) {
     const int64_t per_row = n_embd / 256;
-    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
-                                                                                           (__half*) dst);
+    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(gate_type, up_type, gate,
+                                                                                           up, per_row, (__half*) dst);
     check("iq_dequant_gu_f16");
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
+    L.up_type = up_type;
     L.d_type = d_type;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
+    L.up_row = iq_row_bytes(up_type, n_embd);
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
-    L.down_off = 2 * L.up_off;
+    L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     return L;
 }
@@ -1286,25 +1343,33 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
-    switch (L.gu_type) {
-        case 1: native_gu_kernel<1><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 21: native_gu_kernel<21><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 22: native_gu_kernel<22><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 23: native_gu_kernel<23><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 19: native_gu_kernel<19><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 12: native_gu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 14: native_gu_kernel<14><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 8: native_gu_kernel<8><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 11: native_gu_kernel<11><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 10: native_gu_kernel<10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+    // one shared type: the combined kernel computes both roles in one launch.  A mixed-quant layer (gate_type !=
+    // up_type) launches the per-role kernel twice, each role with its own type and row stride.
+#define GU_CASE(TY) \
+    case TY: native_gu_kernel<TY><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break
+#define GU_ROLE_CASE(TY) \
+    case TY: native_gu_role_kernel<TY><<<ggr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, role, outp); break
+    if (L.gu_type == L.up_type) {
+        switch (L.gu_type) {
+            GU_CASE(1); GU_CASE(2); GU_CASE(16); GU_CASE(17); GU_CASE(18); GU_CASE(21); GU_CASE(22); GU_CASE(23); GU_CASE(29);
+            GU_CASE(19); GU_CASE(42); GU_CASE(13); GU_CASE(12); GU_CASE(14); GU_CASE(8); GU_CASE(11); GU_CASE(10);
+            default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        }
+    } else {
+        const dim3 ggr((unsigned) ((L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+        for (int role = 0; role < 2; ++role) {
+            float* outp = role ? up : gate;
+            switch (role ? L.up_type : L.gu_type) {
+                GU_ROLE_CASE(1); GU_ROLE_CASE(2); GU_ROLE_CASE(16); GU_ROLE_CASE(17); GU_ROLE_CASE(18); GU_ROLE_CASE(21); GU_ROLE_CASE(22);
+                GU_ROLE_CASE(23); GU_ROLE_CASE(29); GU_ROLE_CASE(19); GU_ROLE_CASE(42); GU_ROLE_CASE(13); GU_ROLE_CASE(12);
+                GU_ROLE_CASE(14); GU_ROLE_CASE(8); GU_ROLE_CASE(11); GU_ROLE_CASE(10);
+                default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", role ? L.up_type : L.gu_type);
+                         std::exit(1);
+            }
+        }
     }
+#undef GU_CASE
+#undef GU_ROLE_CASE
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, swiglu_limit, nh);
@@ -1312,6 +1377,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
         case 1: native_down_kernel<1><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 2: native_down_kernel<2><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 16: native_down_kernel<16><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 17: native_down_kernel<17><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 18: native_down_kernel<18><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

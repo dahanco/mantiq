@@ -4617,14 +4617,16 @@ __device__ unsigned int moe_stream_mask(const MoeDev& d) {
 __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_t* t) {
     const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
     const int rch = r->s_chunks;
-    const unsigned long long gu = r->s_gu, dn = r->s_dn;
+    // part 0 = gate (s_gu bytes), 1 = up (s_up), 2 = down (s_dn): a mixed-quant layer's up has its own size, the
+    // single-type pack's s_up == s_gu (the old layout).  The parts' offsets follow in that order.
+    const unsigned long long gu = r->s_gu, up = r->s_up, dn = r->s_dn;
     const int nb = 3 * rch, G = (int) gridDim.x, b = (int) blockIdx.x;
     const bool split = G >= nb;
     const int nsub = split ? G / nb : 1, sub = split ? b / nb : 0;
     if (nb <= 0 || sub >= nsub) return;
     for (int bit = split ? b % nb : b; bit < nb; bit += split ? nb : G) {
         const int part = bit / rch, c = bit % rch;
-        const unsigned long long len = part == 2 ? dn : gu;
+        const unsigned long long len = part == 2 ? dn : part == 1 ? up : gu;
         const unsigned long long piece = ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
         const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
         if (c1 <= c0) continue;
@@ -4642,7 +4644,7 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
             __threadfence_system();
         }
         __syncthreads();
-        const unsigned long long off = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
+        const unsigned long long off = (part == 0 ? 0ull : part == 1 ? gu : gu + up) + c0 + a0;
         const uint8_t* sp = s + off;
         uint8_t* tp = t + off;
         const size_t nbytes = (size_t) (a1 - a0);
@@ -4778,7 +4780,7 @@ __global__ void __launch_bounds__(NW * 32)
 template<int TG>
 __global__ void __launch_bounds__(GU_WARPS * 32)
 #endif
-moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
+moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, int up_type, float limit,
                                                                     const block_q8_1* __restrict__ xq,
                                                                     block_q8_1* __restrict__ hq,
                                                                     const uint8_t* __restrict__ sh_down, int sh_type,
@@ -4847,8 +4849,26 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     __syncthreads();
     const size_t rb = rbytes<TG>(n_embd);
     const uint8_t* blob = (const uint8_t*) ptr;
-    // each warp: 2 gate + 2 up rows in ONE pass (one activation load per call for all four)
     constexpr int RPW = GU_ROWS / NW;
+    if (up_type != (int) TG) {
+        // mixed-quant layer (native_experts.txt v5): gate and up differ in type, so each row takes the runtime-typed
+        // dot (row_dot, warp-reduced) instead of TG's shared-activation rows_dot - the two matrices no longer share a
+        // row size.  The up region begins at n_ff * rb (the gate's own bytes: up_off == gu_row * n_ff), the same offset
+        // the single-type path uses.  Both types share one activation format (native_fmt pins vec_dot_type), so xg is
+        // the q8_1 the gate reads too.
+        const uint8_t* up = blob + (size_t) n_ff * rb;
+#pragma unroll
+        for (int j = 0; j < RPW; ++j) {
+            const int r = chunk * GU_ROWS + warp * RPW + j;
+            const float g = any_row_dot(TG, blob, r, xg, nullptr, n_embd, lane);
+            const float u = any_row_dot(up_type, up, r, xg, nullptr, n_embd, lane);
+            if (lane == 0) {
+                sg[warp * RPW + j] = g;
+                su[warp * RPW + j] = u;
+            }
+        }
+    } else {
+    // each warp: 2 gate + 2 up rows in ONE pass (one activation load per call for all four)
     const uint8_t* rows[2 * RPW];
 #pragma unroll
     for (int j = 0; j < RPW; ++j) {
@@ -4875,6 +4895,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
             sg[warp * RPW + j] = s[j];
             su[warp * RPW + j] = s[RPW + j];
         }
+    }
     }
     __syncthreads();
     if (warp == 0) {
@@ -6836,7 +6857,8 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
                const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     const bool shared = sh_down && sh_out;
     const dim3 grid(n_ff / GU_ROWS, k + (shared && !SPLIT ? 1 : 0));
-    moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(d, shared ? k : k + 1, n_embd, n_ff,
+    // (T is both the gate's and the up's type: the RDNA3 tuned kernels are the single-type packs')
+    moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(d, shared ? k : k + 1, n_embd, n_ff, T,
         limit, (const block_q8_1*) xq, (block_q8_1*) hq, (const uint8_t*) sh_down, sh_type,
         (const block_q8_1*) sh_hq, n_ff_sh, sh_out);
     if constexpr (SPLIT) {
@@ -6853,12 +6875,14 @@ void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off
 } // namespace
 #endif
 
-void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
+void moe_gate_up(int gu_type, int up_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    // The tuned RDNA3 kernels are the single-type packs' (they assume one gate/up row size): a mixed-quant layer
+    // (up_type != gu_type) takes the general dispatch below.
+    const bool tuned = up_type == gu_type && (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
@@ -6883,7 +6907,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     const size_t gx = sm60_gu_stage() && n_embd <= 4 * 4096 ? (size_t) (n_embd / 32) * sizeof(block_q8_1) : 0;
     switch (gu_type) {
 #define GLMF_GU(T) \
-        case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
+        case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, up_type, limit, X, H, SD, sh_type, SH, \
                                                                       n_ff_sh, sh_out); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
         GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8)
@@ -6899,7 +6923,7 @@ namespace hip_expert_bench {
 void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
              const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
              int n_ff_sh, float* sh_out, cudaStream_t s) {
-    if (v == Variant::production) return moe_gate_up(type, d, k, n_embd, n_ff, limit, xq, hq,
+    if (v == Variant::production) return moe_gate_up(type, type, d, k, n_embd, n_ff, limit, xq, hq,
                                                    sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
 #define BENCH_GU(T) case T: \
     if (v == Variant::baseline) launch_expert_gu<T,16,false,false>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
@@ -6944,11 +6968,13 @@ void down(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, siz
 } // namespace hip_expert_bench
 #endif
 
-bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light, int n,
+bool rows_experts(int gu_type, int up_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light, int n,
                   const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo, int rhi,
                   void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s) {
     const auto ok = [](int t) { return t == 16 || t == 18 || t == 19; };
-    if (!ok(gu_type) || !ok(d_type) || n_embd % 256 || n_ff % (GU_ROWS) || n_embd % (GU_WARPS * 2)) return false;
+    // A mixed-quant layer (up_type != gu_type) has no single-type rows kernel (it assumes one gate/up row size):
+    // the caller keeps its per-token path instead, as the header documents.
+    if (!ok(gu_type) || !ok(up_type) || !ok(d_type) || up_type != gu_type || n_embd % 256 || n_ff % (GU_ROWS) || n_embd % (GU_WARPS * 2)) return false;
     if (n <= 0 || rhi <= rlo) return true;
     auto* xq = (block_q8_1*) xq_scratch;
     auto* hq = (block_q8_1*) hq_scratch;
@@ -6999,12 +7025,15 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     launch_check("moe_down");
 }
 
-bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
+bool moe_experts_multi(int gu_type, int up_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
     MoeDev d = d_in;
     d.skip = g_skip;
+    // A mixed-quant layer (up_type != gu_type) is not served here: moe_gate_up_kernel's multi-token launch assumes
+    // one gate/up row size, so the caller keeps its per-token path (the header documents the same restriction).
+    if (up_type != gu_type) return false;
     const int T = d.mt_T;
     if (T < 1 || k > 8 || n_ff % GU_ROWS != 0 || n_embd % DOWN_ROWS != 0) return false;
     const bool sh = sh_down != nullptr && sh_out != nullptr;
@@ -7020,15 +7049,15 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     if (tuned) {
         if (gu_type == 16)
             moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+                d, kk, n_embd, n_ff, up_type, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
         else
             moe_gate_up_kernel<22, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+                d, kk, n_embd, n_ff, up_type, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
     } else {
         switch (gu_type) {
 #define GLMF_GUM(TT) \
             case TT: moe_gate_up_kernel<TT, GU_WARPS, false, false, false, false, false, 0, true><<<ggu, GU_WARPS * 32, 0, s>>>( \
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
+                d, kk, n_embd, n_ff, up_type, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
             GLMF_GUM(16) GLMF_GUM(18) GLMF_GUM(19) GLMF_GUM(23) GLMF_GUM(10) GLMF_GUM(11) GLMF_GUM(17) GLMF_GUM(22)
             GLMF_GUM(21) GLMF_GUM(29) GLMF_GUM(12) GLMF_GUM(13) GLMF_GUM(14)
 #undef GLMF_GUM
@@ -7061,7 +7090,7 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     launch_check("moe_experts_multi");
     return true;
 #else
-    (void) gu_type, (void) d_type, (void) d_in, (void) k, (void) n_embd, (void) n_ff, (void) limit, (void) down_off;
+    (void) gu_type, (void) up_type, (void) d_type, (void) d_in, (void) k, (void) n_embd, (void) n_ff, (void) limit, (void) down_off;
     (void) xq, (void) hq, (void) sh_down, (void) sh_type, (void) sh_hq, (void) n_ff_sh, (void) sh_out, (void) out;
     (void) s;
     return false;

@@ -23,7 +23,7 @@ namespace strata::kernels {
 // and that reuse only pays at large T (measured: T 4->8 = +12%, T 64 = 2.3x, T 256 = 8x).  The per-token kernels
 // (`gdn_conv_l2_multi`, `gdn_step_norm_multi`) already walk `n_tok` internally; only `gdn_ab_multi` held a
 // `float acc[kVerifyMaxT]` register array and is tiled by AB_TILE below.
-inline constexpr int kVerifyMaxT = 32;
+inline constexpr int kVerifyMaxT = 256;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.

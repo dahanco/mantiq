@@ -78,12 +78,14 @@ int main(int argc, char** argv) {
     const int layer = std::atoi(argv[2]);
     std::ifstream ne(pack + "/native_experts.txt");
     std::string line, shard0;
-    int gu = -1, dt = -1;
+    int gu = -1, ut = -1, dt = -1;
+    bool v5 = false;   // v5 rows carry gate, up and down types (a mixed-quant layer); v3/v4 one gu_type
     uint64_t go = 0, uo = 0, dof = 0;
     std::string shard;
     while (std::getline(ne, line)) {
         if (line.empty()) continue;
         if (line[0] == '#') {
+            if (line.find("native experts v5") != std::string::npos) v5 = true;
             const std::string key = "absolute offsets in ";
             const size_t a = line.find(key);
             if (a != std::string::npos) {
@@ -95,7 +97,10 @@ int main(int argc, char** argv) {
         std::istringstream ss(line);
         int l = -1;
         uint64_t off = 0, blob = 0;
-        ss >> l >> gu >> dt >> off >> blob >> go >> uo >> dof;
+        if (!(v5 ? (bool) (ss >> l >> gu >> ut >> dt >> off >> blob >> go >> uo >> dof)
+                 : (bool) (ss >> l >> gu >> dt >> off >> blob >> go >> uo >> dof)))
+            break;
+        if (!v5) ut = gu;   // v3/v4: gate and up share one type
         std::string w;
         ss >> w;
         if (l == layer) {
@@ -110,7 +115,7 @@ int main(int argc, char** argv) {
     const int n_embd = 4096, n_ff = 2048, n_exp = 64;
     strata::kernels::cpu::NativeFmt f;
     std::string err;
-    if (!strata::kernels::cpu::native_fmt(gu, dt, n_embd, n_ff, f, err)) {
+    if (!strata::kernels::cpu::native_fmt(gu, ut, dt, n_embd, n_ff, f, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 1;
     }

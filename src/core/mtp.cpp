@@ -225,12 +225,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             std::ifstream et(rt_dir + "/experts.txt");
             if (!et) { err = "mtp: cannot open " + rt_dir + "/experts.txt (run tools/mtp_from_gguf.py)"; return false; }
             int64_t ne = 0, nff = 0;
-            if (!(et >> expert_gu_type_ >> expert_d_type_ >> ne >> nff)) {
-                err = "mtp: malformed experts.txt (gu_type d_type n_embd n_ff)";
-                return false;
+            if (!(et >> expert_gu_type_ >> expert_up_type_ >> expert_d_type_ >> ne >> nff)) {
+                // a v3 pack's experts.txt names one type for gate and up (gu_type d_type n_embd n_ff)
+                et.clear();
+                et.seekg(0);
+                if (!(et >> expert_gu_type_ >> expert_d_type_ >> ne >> nff)) {
+                    err = "mtp: malformed experts.txt (gu_type [up_type] d_type n_embd n_ff)";
+                    return false;
+                }
+                expert_up_type_ = expert_gu_type_;
             }
             const strata::kernels::NativeExpertLayout E =
-                strata::kernels::native_expert_layout(expert_gu_type_, expert_d_type_, ne, nff);
+                strata::kernels::native_expert_layout(expert_gu_type_, expert_up_type_, expert_d_type_, ne, nff);
             if (E.bytes == 0) { err = "mtp: experts.txt names a block layout the grouped kernel cannot read"; return false; }
             expert_blob_ = E.bytes;
             bytes = E.bytes * (uint64_t) g.n_expert;
@@ -707,7 +713,7 @@ bool MtpDrafter::record_forward_plain(int T, int step_row0, cudaStream_t cs, std
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) expert_blob_, grp_ptr_, grp_start_,
                            grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_1_rows(mixed_, (int64_t) T, N, nat_xq_, cs);
-        const NativeExpertLayout L = native_expert_layout(expert_gu_type_, expert_d_type_, g.n_embd, g.n_ff);
+        const NativeExpertLayout L = native_expert_layout(expert_gu_type_, expert_up_type_, expert_d_type_, g.n_embd, g.n_ff);
         native_expert_grouped(L, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) (T * K), (int64_t) (T * K),
                               nat_xq_, hit_scratch_, parts_, cs);
         NativeSharedWeights nsw;

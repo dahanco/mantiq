@@ -7532,7 +7532,8 @@ def write_config_qwen_moe(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: 
     cfg_path = ROOT / f"{Q.config_stem('qwen', e['key'])}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
     # the same Qwen path as CYBER-FROST's, without the pieces a qwen35moe file has none of: no --ple-gguf (no n-gram
-    # table to open) and prompts written whole (--prefill 0: no batched prefill).  --mtp carries the drafter the setup
+    # table to open) and prompts read in 512-token chunks (--prefill 512: qwen35moe's own chunked prompt path).
+    # --mtp carries the drafter the setup
     # built from the model's NextN block when it has one (--mtp-max-t 2: drafts of up to two tokens), and the engine's
     # prompt lookup (--suffix-draft) drafts alongside it.  --expert-profile carries this model's own file, built inside
     # its pack (qwen_expert_profile: --spec needs the device residency table the profile builds), and
@@ -7540,7 +7541,7 @@ def write_config_qwen_moe(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: 
     mtp = (pack / "mtp" / "dense.txt").exists()
     args = ["--pack", str(pack), "--native", str(gguf), "--max-context", str(ctx),
             "--spec", "4", "--prompt-window", "16", "--suffix-draft", "4", "--mtp-max-t", "2" if mtp else "1",
-            "--expert-cache", "auto", "--prefill", "0", "--stop-eos", "--adapt-every", "16", "--kv", QWEN_KV]
+            "--expert-cache", "auto", "--prefill", "512", "--stop-eos", "--adapt-every", "16", "--kv", QWEN_KV]
     if mtp:
         args += ["--mtp", str(pack / "mtp")]
     prof = qwen_expert_profile(pack)

@@ -36,7 +36,7 @@ public:
     bool profiling() const { return prof_; }         // STRATA_GLM_PROF read at open
     size_t available() const { return capacity_ - used_; }
     size_t used() const { return used_; }
-    bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+    bool compute(int gu_type, int up_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);
     void close();

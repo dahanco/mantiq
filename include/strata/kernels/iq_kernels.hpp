@@ -34,9 +34,10 @@ void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void*
 void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
                    int64_t n_embd, float* out, void* stream);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
-/// uses: row 2r = gate row r, row 2r+1 = up row r.
-void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
-                       void* stream);
+/// uses: row 2r = gate row r, row 2r+1 = up row r.  `gate_type` and `up_type` are the two weight types (equal for
+/// the single-type packs).
+void iq_dequant_gu_f16(int gate_type, int up_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                       uint16_t* dst, void* stream);
 
 /// The grouped WMMA launches' by-value weight table (the Volta prompt experts, STRATA_PF_WMMA): expert e's gate/up
 /// matrix at gu[e], its down matrix at dn[e].  The prompt path's group size (16) is the table's capacity.
@@ -63,15 +64,18 @@ bool gemm_iq_f16_grouped(int ggml_type, const void* W, size_t expert_bytes, int 
 /// of attempting a launch; `gemm_iq_f16_grouped` checks the same table per launch either way.
 bool gemm_iq_f16_grouped_supported(int dev);
 
-/// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
+/// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.  Gate and up each
+/// have `n_ff` rows of `n_embd` values; a mixed-quant layer (native_experts.txt v5) may give them different types,
+/// so each carries its own row size.  `gu_type` is the gate's type.  When gate and up share a type this is the
+/// single-type layout (`up_row == gu_row`, `up_off == n_ff * gu_row`, `down_off == 2 * up_off`).
 struct NativeExpertLayout {
-    int gu_type = -1, d_type = -1;
+    int gu_type = -1, up_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;
-    size_t gu_row = 0, d_row = 0;       // bytes per row
-    size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
-    size_t bytes = 0;                   // the whole blob
+    size_t gu_row = 0, up_row = 0, d_row = 0;   // bytes per row
+    size_t up_off = 0, down_off = 0;            // byte offsets inside the blob
+    size_t bytes = 0;                           // the whole blob
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+NativeExpertLayout native_expert_layout(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

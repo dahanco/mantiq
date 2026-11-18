@@ -11,7 +11,7 @@ experts differently on each:
   qwen35moe   the 256 experts as the block's OWN GGUF blocks - [gate rows | up rows | down rows], raw Q4_K/Q6_K
               bytes, exactly what `native_expert_layout` describes.  No re-quantization: the bytes the model
               ships are the bytes the grouped native kernel reads.  Qwopus3.6-35B-A3B's blk.40.
-              An extra `experts.txt` line (`gu_type d_type n_embd n_ff`) tells the loader which layout it got.
+              An extra `experts.txt` line (`gu_type up_type d_type n_embd n_ff`) tells the loader which layout it got.
 
 The block's tensors are dequantized (gguf-py) and written as the drafter reads them (src/core/mtp.cpp):
   dense.bin     the projections as Q8_0, the router/norms as BF16/F32
@@ -118,6 +118,7 @@ def main() -> int:
             print(f"{a.gguf}: qwen35moe metadata is incomplete (embedding_length/expert_feed_forward_length/expert_count)")
             return 2
         gu_t, d_t = tens[f"blk.{b}.ffn_gate_exps.weight"], tens[f"blk.{b}.ffn_down_exps.weight"]
+        u_t = tens[f"blk.{b}.ffn_up_exps.weight"]
         # ---- the experts: the block's own blocks, gate/up rows then down rows, one expert after another
         with open(out / "experts.bin.tmp", "wb") as f:
             g_raw, u_raw, dn_raw = raw("ffn_gate_exps.weight"), raw("ffn_up_exps.weight"), raw("ffn_down_exps.weight")
@@ -127,7 +128,7 @@ def main() -> int:
                 f.write(dn_raw[e].tobytes())
         (out / "experts.bin.tmp").replace(out / "experts.bin")
         (out / "experts.txt").write_text(
-            f"{int(gu_t.tensor_type)} {int(d_t.tensor_type)} {H} {FF}\n", encoding="utf-8")
+            f"{int(gu_t.tensor_type)} {int(u_t.tensor_type)} {int(d_t.tensor_type)} {H} {FF}\n", encoding="utf-8")
         eh = f32("nextn.eh_proj.weight")                     # (H, 2H): rows out, columns in
         emb, hid = (eh[:, :H], eh[:, H:]) if a.eh_order == "emb-first" else (eh[:, H:], eh[:, :H])
         dense = [

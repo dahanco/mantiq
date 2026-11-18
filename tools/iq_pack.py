@@ -454,21 +454,23 @@ def main() -> int:
     for l in moe_layers:
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
-            print("layer %d: gate and up differ in type" % l)
-            return 1
+        # Gate and up may differ in type: a mixed-quant model (Apex-35B keeps IQ3_S gate with Q5_K up and
+        # down in its last MoE layer) is legal.  The blob is still [gate rows | up rows | down rows], and the
+        # engine reads the up rows with up_type and its own row stride (native_experts.txt v5).
         blob = per[0] + per[1] + per[2]
-        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
+        layout.append((l, ts[0].type_id, ts[1].type_id, ts[2].type_id, offset, blob, ts))
         offset += blob * n_expert
     with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
         straddle = any(len({w[3] for w in (model.where[t.name] for t in ts)}) != 1
-                       for _, _, _, _, _, ts in layout)
-        version = "v4" if straddle else "v3"
-        fo.write("# strata native experts %s: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                       for _, _, _, _, _, _, ts in layout)
+        # v5: at least one layer's gate and up differ in type (three type fields); else v3/v4 (one gu_type).
+        mixed = any(gt != ut for _, gt, ut, _, _, _, _ in layout)
+        version = "v5" if mixed else ("v4" if straddle else "v3")
+        fo.write("# strata native experts %s: layer %s offset blob_bytes gate_off up_off down_off "
                  "[shard | gate_shard up_shard down_shard] "
                  "(n_expert %d, total %d; absolute offsets in %s, or in the named shard(s) beside it)\n"
-                 % (version, n_expert, offset, src.name))
-        for l, gt, dt, off, blob, ts in layout:
+                 % (version, "gate_type up_type d_type" if mixed else "gu_type d_type", n_expert, offset, src.name))
+        for l, gt, ut, dt, off, blob, ts in layout:
             ws = [model.where[t.name] for t in ts]
             shards = [w[3] for w in ws]
             # each role's offset is absolute in ITS OWN named shard: the data_start of the
@@ -476,9 +478,10 @@ def main() -> int:
             # gate role's file for every role put layer 25's down 7616 bytes low in the
             # UD-IQ1_S pack: gate/up sat in one shard, down in another.)
             offs = [w[0].data_start + t.offset for w, t in zip(ws, ts)]
+            tys = "%d %d %d" % (gt, ut, dt) if mixed else "%d %d" % (gt, dt)
             if len(set(shards)) == 1:
                 # v3 row: one shard for the whole blob (omitted when it is shard 1)
-                line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *offs)
+                line = "%d %s %d %d %d %d %d" % (l, tys, off, blob, *offs)
                 fo.write(line + ("" if shards[0] == src else " " + shards[0].name) + "\n")
             else:
                 # v4 row: the layer straddles shards (a shard boundary inside a layer); each
@@ -488,8 +491,8 @@ def main() -> int:
                 # checks each offset against that shard's directory at load, so gate and up may
                 # sit in different files too (a split by size can cut between them).
                 names = [s.name for s in shards]
-                fo.write("%d %d %d %d %d %d %d %d %s\n"
-                         % (l, gt, dt, off, blob, *offs, " ".join(names)))
+                fo.write("%d %s %d %d %d %d %d %s\n"
+                         % (l, tys, off, blob, *offs, " ".join(names)))
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
@@ -499,7 +502,7 @@ def main() -> int:
         print("experts.bin exists with the right size; not rewritten")
         return 0
     with open(path, "wb") as fo:
-        for l, gt, dt, off, blob, ts in layout:
+        for l, gt, ut, dt, off, blob, ts in layout:
             parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
             chunk = np.concatenate(parts, axis=1)          # (n_expert, blob): gate | up | down per expert
             assert chunk.shape == (n_expert, blob)

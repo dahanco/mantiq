@@ -647,7 +647,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             mm.mt_cpu_s = (unsigned int) E;
             const size_t hq_t = 8 * ((size_t) g.n_ff_exp / 32) * q8;
             const bool sh = Ly.sh_down.q != nullptr;
-            if (!gf::moe_experts_multi(Ly.gu_type, Ly.d_type, mm, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,
+            if (!gf::moe_experts_multi(Ly.gu_type, Ly.up_type, Ly.d_type, mm, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,
                                        Ly.down_off, (const uint8_t*) W.xq + (size_t) t0 * W.xq_s,
                                        (uint8_t*) W.whq + (size_t) t0 * hq_t, Ly.sh_down.q, Ly.sh_down.type,
                                        sh ? (const uint8_t*) W.sh_hq + (size_t) t0 * W.sh_hq_s : nullptr, FFs,
@@ -657,7 +657,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                     const gf::MoeDev mt = tok_dev(t);
                     uint8_t* hq = (uint8_t*) W.whq + (size_t) t * hq_t;
                     float* so = sh ? W.sh_out + (size_t) t * E : nullptr;
-                    gf::moe_gate_up(Ly.gu_type, mt, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,
+                    gf::moe_gate_up(Ly.gu_type, Ly.up_type, mt, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,
                                     (const uint8_t*) W.xq + (size_t) t * W.xq_s, hq, Ly.sh_down.q, Ly.sh_down.type,
                                     sh ? (const uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s : nullptr, FFs, so, s);
                     gf::moe_down(Ly.d_type, mt, g.n_exp_used, E, g.n_ff_exp, Ly.down_off, hq, so,
@@ -792,7 +792,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             x3::moe_gate_up(xa, x, nullptr, s);
             x3::moe_down(xa, nullptr, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, ffn, s);
         } else {
-            gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp, xq, F->hq, Ly.sh_down.q,
+            gf::moe_gate_up(Ly.gu_type, Ly.up_type, md, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp, xq, F->hq, Ly.sh_down.q,
                             Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
             gf::moe_down(Ly.d_type, md, g.n_exp_used, E, g.n_ff_exp, Ly.down_off, F->hq,
                          Ly.sh_down.q != nullptr ? F->sh_out : nullptr, ffn, s);

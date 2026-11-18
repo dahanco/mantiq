@@ -349,10 +349,10 @@ struct MoeResponse {
     unsigned long long ptr[8];
     // STRATA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
     // bit (part * s_chunks + chunk) as each chunk lands in ptr[i] (fast_read_part's layout: gate 0, up s_gu, down
-    // 2 s_gu), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
+    // s_gu + s_up), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
     unsigned int stream_mask;
     unsigned int ready[8];
-    unsigned long long s_gu, s_dn;
+    unsigned long long s_gu, s_up, s_dn;
     int s_chunks;
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
@@ -428,8 +428,10 @@ struct CpuWaitRows {
 void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and
 /// sh_out given) the shared expert's down rows over its h in sh_hq into sh_out, by extra blocks of the same launch.
-void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
-                 const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s);
+/// `up_type` is the up matrix's type - a mixed-quant layer (native_experts.txt v5) may differ from `gu_type` (the gate's);
+/// equal types are the single-type pack (v3/v4).
+void moe_gate_up(int gu_type, int up_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq,
+                 void* hq, const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s);
 /// out[r] = (sum_i w_i * down_i(r) . h_i over the resident experts) [+ cpu_part[r]] + sh_out[r] (when given).
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
@@ -437,8 +439,9 @@ void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t d
 /// moe_gate_up then moe_down for d.mt_T tokens in two launches (a verify window's tokens, each with its own plan and
 /// rows at d's mt_ strides): every token's arithmetic is its moe_gate_up / moe_down's, the blocks of all the tokens for
 /// a chunk of rows issued together - an expert two tokens route reads its rows once from DRAM.  AMD builds only (the
-/// token path's RDNA3 kernels); false: not here, nothing launched (the caller runs the tokens one by one).
-bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
+/// token path's RDNA3 kernels); false: not here, nothing launched (the caller runs the tokens one by one).  `up_type`
+/// (the up matrix's type) must equal `gu_type` here: a mixed-quant layer takes the per-token path instead.
+bool moe_experts_multi(int gu_type, int up_type, int d_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s);
 
@@ -447,10 +450,11 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d, int k, int n_em
 /// [r0, r0 + nr) of the sorted rows (token row_tok[r]), all inside [rlo, rhi).  x: the chunk's n_tok token rows
 /// (n_embd floats).  Gate/up then swiglu (limit) then down, the down rows into out rows (ld floats apart; out also
 /// holds the gate/up rows in between).  Scratch: xq for n_tok x n_embd q8_1, hq for (rhi - rlo) x n_ff q8_1.
-/// False: a type without the light kernels (the caller keeps MMQ for them).
-bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, size_t down_off, const int* light, int n,
-                  const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff, float limit, int rlo, int rhi,
-                  void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s);
+/// False: a type without the light kernels (the caller keeps MMQ for them), or `up_type != gu_type` (a mixed-quant
+/// layer - these kernels assume one gate/up row size).
+bool rows_experts(int gu_type, int up_type, int d_type, const uint8_t* base, size_t stride, size_t down_off,
+                  const int* light, int n, const int* row_tok, const float* x, int n_tok, int n_embd, int n_ff,
+                  float limit, int rlo, int rhi, void* xq_scratch, void* hq_scratch, float* out, int ld, cudaStream_t s);
 
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);

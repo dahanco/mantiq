@@ -151,7 +151,7 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 #if !defined(STRATA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
 bool native_experts_available() noexcept { return false; }
-bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
+bool native_fmt(int, int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
@@ -178,6 +178,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    bool v5 = false;   // v5 rows carry three type fields (gate up down); v3/v4 one gu_type
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -187,18 +188,21 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                if (line.find("native experts v5") != std::string::npos) v5 = true;
             }
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, gt = -1, ut = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        const bool head = v5 ? (bool) (ss >> l >> gt >> ut >> dt >> off >> blob) : (bool) (ss >> l >> gt >> dt >> off >> blob);
+        if (!head || l < 0 || l >= n_layers) {
             err = "native_experts.txt: a malformed line: " + line;
             return false;
         }
+        if (!v5) ut = gt;   // v3/v4: gate and up share one type
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err)) return false;
+        if (!native_fmt((int) gt, (int) ut, (int) dt, n_embd, n_ff, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

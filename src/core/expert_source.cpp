@@ -1287,7 +1287,9 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             if (l >= lay.n_layers || bad) break;
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            // gate, up and down have their own types (a mixed-quant layer keeps gate at a different one), so their
+            // row sizes differ too: up runs from up_off to down_off, not the gate's width
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const std::string name = file_of(l, r);
@@ -1779,7 +1781,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
         // every slice of this layer inside its own file: refused at open rather than faulting at token 4000
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t blob = lay.bytes[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
         for (int r = 0; r < 3; ++r) {
             const Map& m = maps_[(size_t) map_of_[(size_t) (3 * l + r)]];
             const uint64_t off = lay.gguf_off[(size_t) (3 * l + r)], need = per[r] * (uint64_t) n_expert;
@@ -1877,8 +1879,10 @@ void GgufExpertSource::parts(int64_t layer, int64_t expert, const uint8_t* src[3
     const auto& lay = strata::kernels::cpu::expert_layout();
     const auto& fm = lay.fmt[(size_t) layer];
     const uint64_t blob = lay.bytes[(size_t) layer];
+    // gate, up and down carry their own type (native_experts.txt v5 lets gate differ from up), so each role's row
+    // stride is its own: up is up_off..down_off wide, down is the rest of the blob
     bytes[0] = fm.up_off;
-    bytes[1] = fm.up_off;
+    bytes[1] = fm.down_off - fm.up_off;
     bytes[2] = blob - fm.down_off;
     for (int r = 0; r < 3; ++r) {   // each role out of its own shard (a v4 pack may straddle a shard boundary)
         const Map& m = maps_[(size_t) map_of_[(size_t) (3 * layer + r)]];

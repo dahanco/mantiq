@@ -1088,7 +1088,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (!Ly.exl3 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))   // (EXL3: run_set_x3)
                 why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                        std::to_string(Ly.d_type) + ") ";
-            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
+            gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.up_type, Ly.d_type));
         } else {
             has_dense = true;
             deq_ok(Ly.ffn_gate, "ffn_gate", il);
@@ -1146,8 +1146,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe) continue;
         blob_sum += Ly.blob;
-        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
-        stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
+        stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.up_type, Ly.d_type);
+        stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.up_type, Ly.d_type));
     }
     const int64_t keep = Glm5Model::pool_keep(g.n_exp_used);
     if (getenv("STRATA_GLM_PREFILL_KEEP") != nullptr)
@@ -3519,7 +3519,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the layer's whole pool partition (the light ones empty there), while the copy stream stages
         if (n_light > 0) {
             const int o = place(rows_mmq, rows_res - rows_mmq);   // (light rows: at most kLightMax * kLightRows <= W)
-            if (!gf::rows_experts(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off, M.bounds + kLightOff, n_light,
+            if (!gf::rows_experts(Ly.gu_type, Ly.up_type, Ly.d_type, P.base, P.stride, Ly.down_off, M.bounds + kLightOff, n_light,
                                   M.row_tok, S->x, T, E, nff, g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
                                   M.OUTP + (size_t) (o - rows_mmq) * E, E, s)) {
                 err = "glm prefill: the light expert kernels refused the layer's types";

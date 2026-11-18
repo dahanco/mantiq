@@ -47,6 +47,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/qwen35moe_prefill.hpp"
 #include "strata/prefill/failure.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
@@ -5162,10 +5163,11 @@ int main(int argc, char** argv) {
                      std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
-        // qwen35moe has no chunked-prefill path yet (see "prefill: geometry differs" below), so a
-        // multi-token prompt is fed through the T=1 decode loop instead - allow --prefill 0 for it.
+        // qwen35moe's own chunked path now exists (include/strata/prefill/qwen35moe_prefill.hpp), so every
+        // native pack needs `--prefill CHUNK` again: no architecture is fed a multi-token prompt one token at
+        // a time by default.
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
-            (o.prefill_chunk <= 0 && o.tokens.size() > 1 && !model_is_qwen35moe)) {
+            (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
             std::fprintf(stderr, "mntq generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
@@ -5346,6 +5348,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mntq generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
                      (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+
+    // ---- The prompt path's own device buffers, in MiB: what every planning step below has to keep out of the
+    // expert cache's share.  `Prefill` (the G2/qwen4exp path) either lends cache slots or allocates its own
+    // buffers, measured at 160 MiB plus ~680 KB per chunk token (plan v0.3 P5).  qwen35moe has its own chunk
+    // path (`Qwen35MoePrefill`) and lends NO slots: it allocates one arena, whose size is its own
+    // `bytes_needed` - a fixed part (the GEMM scratch and workspace, the expert ring) plus ~230 KB per token.
+    const bool qm_prompt = native_pack && model_is_qwen35moe;
+    auto prompt_path_mib = [&](int64_t chunk) -> int64_t {
+        if (chunk <= 0) return 0;
+        if (qm_prompt)
+            return (int64_t) (strata::prefill::Qwen35MoePrefill::bytes_needed(g, ss, chunk) >> 20) + 64;
+        return 160 + (chunk * 680) / 1024;
+    };
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -5702,7 +5717,7 @@ int main(int argc, char** argv) {
     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
     // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
-    const int64_t split_pf_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+    const int64_t split_pf_mib = prompt_path_mib(o.prefill_chunk);
     auto stage_room = [&](int dev, bool later) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -5846,9 +5861,10 @@ int main(int argc, char** argv) {
         cudaMemGetInfo(&free_b, &total_b);
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
-        // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
-        const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        // (with borrowing - the default with a profile - the prompt path lends cache slots instead; the
+        // qwen35moe chunk path always allocates its own, so it never lends)
+        const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty() && !qm_prompt;
+        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? prompt_path_mib(o.prefill_chunk) : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -5901,7 +5917,7 @@ int main(int argc, char** argv) {
         // for them and the reserve, or the first prompt fails with "device buffers ... do not fit"
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = prompt_path_mib(o.prefill_chunk);
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
@@ -6549,6 +6565,35 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    // --dump-logits (issue #658) on a chunked prompt path: the header announces a row for every position from 0,
+    // and a chunk computes no head - so each chunk's rows go through the token path's own head from the residual
+    // rows the chunk leaves (what the draft layer reads too).  The prompt is read exactly as without the dump, so
+    // the file is the same; `dump_positions`/`--logits-stride` pick the rows here as everywhere else.
+    auto dump_prompt_rows = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        if (dump == nullptr) return true;
+        strata::core::BlockBuffers bb = ss.block;
+        for (int64_t t = 0; t < T; ++t) {
+            if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
+            bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.residual_streams() * g.n_embd);
+            const bool ok = native_head.loaded()
+                                ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
+                                      native_head.run(bb.mixed, d_logits, main_cs, e)
+                                : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
+            if (!ok) return false;
+            if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
+                                (cudaStream_t) main_cs) != cudaSuccess ||
+                cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                e = "reading a prompt row's logits back failed";
+                return false;
+            }
+            if (std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                e = "cannot write logits at position " + std::to_string(p0 + t);
+                return false;
+            }
+        }
+        return true;
+    };
 
     // ---- THE C1 ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
@@ -8610,6 +8655,7 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    strata::prefill::Qwen35MoePrefill qprefill;   // qwen35moe's own chunk path (see `qm_prompt`)
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.residual_streams() * g.n_embd) : 0);
@@ -8619,7 +8665,12 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
-        if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
+        if (qm_prompt) {
+            // qwen35moe's own chunk path allocates its arena (it borrows no cache slots: it is not `Prefill`'s
+            // layout, so a lent region could not be handed to it).
+            std::fprintf(stderr, "mntq generate: qwen35moe prompt path: its own buffers, %lld MiB for %lld-token "
+                                 "chunks\n", (long long) prompt_path_mib(o.prefill_chunk), (long long) o.prefill_chunk);
+        } else if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
             const int64_t request_sized = request_chunk(n_batched, chunk);
@@ -8651,58 +8702,47 @@ int main(int argc, char** argv) {
                              (double) borrow_bytes / 1073741824.0);
             }
         }
-        if (borrow == nullptr)
+        if (!qm_prompt && borrow == nullptr)
             std::fprintf(stderr, "mntq generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+        const bool inited =
+            qm_prompt
+                ? qprefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                                host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, &pool)
+                : prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                               host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
+                               borrow_bytes);
+        if (!inited) {
             std::fprintf(stderr, "mntq generate: %s\n", err.c_str());
             return 1;
         }
+        // The MTP draft layer's hook: cell i pairs R_i with the token at i + 1 (every such token is in the
+        // prompt).  qwen35moe's drafter is fed the chunk's rows directly (`mtp.prefill`, the way its verify
+        // windows feed it): `draft_kv` relayouts the G2 artifact's shared K/V and is not this model's.
+        std::function<bool(const float*, int64_t, int64_t, std::string&)> mtp_chunk;
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "mntq generate: %s\n", err.c_str());
                 return 1;
             }
-            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
-                // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
+            mtp_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                 std::vector<int32_t> nxt((size_t) T);
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
+                if (qm_prompt) return mtp.prefill(R_rows, nxt.data(), T, p0, e);
                 if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
-        // --dump-logits (issue #658): the header announces a row for every position from 0, and the batched path
-        // computes no head - so each chunk's rows go through the token path's head from the final residuals the
-        // chunk leaves (what the draft layer reads too).  The prompt is read as without the dump: the same answer.
+        auto& chunk_hook = qm_prompt ? qprefill.on_chunk : prefill.on_chunk;
+        chunk_hook = mtp_chunk;   // (empty without --mtp, as before)
         if (dump != nullptr) {
-            auto mtp_chunk = prefill.on_chunk;   // (empty without --mtp)
-            prefill.on_chunk = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
-                strata::core::BlockBuffers bb = ss.block;
-                for (int64_t t = 0; t < T; ++t) {
-                    if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
-                    bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.residual_streams() * g.n_embd);
-                    const bool ok = native_head.loaded()
-                                        ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
-                                              native_head.run(bb.mixed, d_logits, main_cs, e)
-                                        : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
-                    if (!ok) return false;
-                    if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
-                                        (cudaStream_t) main_cs) != cudaSuccess ||
-                        cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
-                        e = "reading a prompt row's logits back failed";
-                        return false;
-                    }
-                    if (std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
-                        e = "cannot write logits at position " + std::to_string(p0 + t);
-                        return false;
-                    }
-                }
-                return !mtp_chunk || mtp_chunk(R_rows, T, p0, e);
+            chunk_hook = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                return dump_prompt_rows(R_rows, T, p0, e) && (!mtp_chunk || mtp_chunk(R_rows, T, p0, e));
             };
         }
         const Clock::time_point tp0 = Clock::now();
-        if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
+        const bool ran = qm_prompt ? qprefill.run(o.tokens.data(), n_batched, 0, err)
+                                   : prefill.run(o.tokens.data(), n_batched, 0, err);
+        if (!ran) {
             std::fprintf(stderr, "mntq generate: %s\n", err.c_str());
             return 1;
         }
@@ -8735,12 +8775,20 @@ int main(int argc, char** argv) {
         // the PLE window of the token path: the two tokens before `pos_start`
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
-        const strata::prefill::PrefillStats& ps = prefill.stats();
-        std::fprintf(stderr, "mntq generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
-                             "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
-                     (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
-                     ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
-                     (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
+        if (qm_prompt) {
+            const strata::prefill::Qwen35MoePrefillStats& qs = qprefill.stats();
+            std::fprintf(stderr, "mntq generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s)\n",
+                         (long long) qs.tokens, (long long) qs.chunks, qs.ms_total,
+                         qs.ms_total > 0 ? 1000.0 * (double) qs.tokens / qs.ms_total : 0.0);
+        } else {
+            const strata::prefill::PrefillStats& ps = prefill.stats();
+            std::fprintf(stderr, "mntq generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
+                                 "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
+                         (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
+                         ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0,
+                         (long long) ps.experts_streamed, (long long) ps.experts_dma, ps.ms_experts_host,
+                         (long long) ps.experts_resident, ps.ms_ple);
+        }
     }
 
     for (int64_t pos = pos_start;; ++pos) {
@@ -8982,6 +9030,10 @@ int main(int argc, char** argv) {
         }
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
+        // qwen35moe's chunked prompt path, built on the first turn that reads a prompt (`read_turn`): one arena
+        // for the whole session, its chunks leaving the state exactly as the verify windows would.  Null until
+        // then, and null again if it cannot be set up - the windows stay the fallback.
+        std::unique_ptr<strata::prefill::Qwen35MoePrefill> qpf;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.cache_base = thits.cache_base;
@@ -9424,6 +9476,52 @@ int main(int argc, char** argv) {
             // new `x` - the same invariant the decode loop above starts from.  A long prompt is many windows, so
             // each one beats the progress clock (the serve watchdog ends the process after 60 s of silence).
             auto read_turn = [&](const std::vector<int64_t>& t, std::string& e) -> bool {
+                // ---- qwen35moe reads its prompts through its own chunk path.  A serve turn IS a prompt, so
+                // this is the path a real request takes; the verify windows below stay for every other native
+                // architecture and as the fallback when the module cannot be set up (no `--prefill`, no room).
+                if (qm_prompt && o.prefill_chunk > 0 && (int64_t) t.size() > 1) {
+                    if (!qpf) {
+                        auto m = std::make_unique<strata::prefill::Qwen35MoePrefill>();
+                        std::string ie;
+                        if (m->init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
+                                    host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, ie, &pool)) {
+                            std::fprintf(stderr, "mntq repl: qwen35moe prompt path: %lld-token chunks, %.1f MiB of "
+                                                 "buffers\n", (long long) m->chunk(),
+                                         (double) strata::prefill::Qwen35MoePrefill::bytes_needed(g, ss, m->chunk()) /
+                                             1048576.0);
+                            qpf = std::move(m);
+                        } else {
+                            std::fprintf(stderr, "mntq repl: %s; reading prompts through verify windows\n", ie.c_str());
+                        }
+                    }
+                    if (qpf) {
+                        const int64_t base0 = p;
+                        std::function<bool(const float*, int64_t, int64_t, std::string&)> mh;
+                        if (use_mtp)
+                            mh = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ee) -> bool {
+                                // cell i pairs R_i with the token at i + 1: the turn's own next token, the
+                                // last of them being the pending `x` - every one of them is in `t`.
+                                std::vector<int32_t> nxt((size_t) T);
+                                for (int64_t q = 0; q < T; ++q)
+                                    nxt[(size_t) q] = (int32_t) t[(size_t) (p0 - base0 + q + 1)];
+                                return mtp.prefill(R_rows, nxt.data(), T, p0, ee);
+                            };
+                        qpf->on_chunk = [&, mh](const float* R_rows, int64_t T, int64_t p0, std::string& ee) -> bool {
+                            strata::core::progress_beat();   // a chunk can outlast the serve watchdog's silence
+                            return dump_prompt_rows(R_rows, T, p0, ee) && (!mh || mh(R_rows, T, p0, ee));
+                        };
+                        qpf->should_stop = [&] { return stop_req.load(); };
+                        if (!qpf->run(t.data(), (int64_t) t.size() - 1, base0, e)) {
+                            if (stop_req.load()) e = "cancelled";
+                            return false;
+                        }
+                        if (native_serve)
+                            for (size_t q = 0; q + 1 < t.size(); ++q) hist.push_back(t[q]);
+                        p = base0 + (int64_t) t.size() - 1;
+                        x = (int32_t) t.back();
+                        return true;
+                    }
+                }
                 // The prompt read's window: `--prompt-window` when set, the decode window (`o.spec`) otherwise.
                 // The verifier was `init`ed with `max(o.spec, o.prompt_window)`, so a `--prompt-window`-sized
                 // window fits the arena and its captured graph; a wider prompt window changes only how the

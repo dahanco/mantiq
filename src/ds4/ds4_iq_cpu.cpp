@@ -50,16 +50,20 @@ namespace kc = strata::kernels::cpu;
 namespace {
 kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookups)
     kc::NativeFmt n;
+    // this lane's experts are single-type (IqCpu carries one type): gate and up share it, so up_row == gu_row
     n.gu_type = f.tg;
+    n.up_type = f.tg;
     n.d_type = f.td;
     n.gu_act = f.gu_act;
+    n.up_act = f.gu_act;
     n.d_act = f.d_act;
     n.n_embd = f.n_embd;
     n.n_ff = f.n_ff;
     n.gu_row = f.gu_row;
+    n.up_row = f.gu_row;
     n.d_row = f.d_row;
     n.up_off = f.gu_row * (size_t) f.n_ff;
-    n.down_off = 2 * n.up_off;
+    n.down_off = n.up_off + f.gu_row * (size_t) f.n_ff;
     n.bytes = n.down_off + f.d_row * (size_t) f.n_embd;
     n.act_bytes = f.act_bytes;
     n.h_bytes = f.h_bytes;
@@ -872,7 +876,7 @@ double time_variant(int type, int variant, int nt = 1) {
     }
     kc::NativeFmt nf;   // (the native rows timed as a gate / up pair of the same rows: 2 x rows dots, as ours below)
     std::string err;
-    if (variant == 0 && !kc::native_fmt(type, type, n, QK_K, nf, err)) return 1e30;
+    if (variant == 0 && !kc::native_fmt(type, type, type, n, QK_K, nf, err)) return 1e30;
     bool* gflag = type == GGML_TYPE_IQ3_XXS ? &g_gather18 : type == GGML_TYPE_IQ3_S ? &g_gather21 :
                   type == GGML_TYPE_IQ2_XXS ? &g_ct16 :
                   type == GGML_TYPE_IQ1_S && isa().bmi2 && !iq1_no_pdep() ? &g_iq1_pdep : nullptr;
@@ -1032,7 +1036,7 @@ bool own_nt(int type, int nt) {
 
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err) {
     kc::NativeFmt n;
-    if (!kc::native_fmt(tg, td, n_embd, n_ff, n, err)) return false;
+    if (!kc::native_fmt(tg, tg, td, n_embd, n_ff, n, err)) return false;
     f.tg = tg;
     f.td = td;
     f.n_embd = n_embd;
@@ -1102,7 +1106,7 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
 int iq_cpu_act_type(int type) {
     kc::NativeFmt n;
     std::string err;
-    return kc::native_fmt(type, type, 256, 256, n, err) ? n.gu_act : -1;
+    return kc::native_fmt(type, type, type, 256, 256, n, err) ? n.gu_act : -1;
 }
 
 void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,

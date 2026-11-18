@@ -854,17 +854,22 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
 
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
-    const block_q8_0* y[8];
+    // Split before filling the fixed-size pointer array: prompt groups can contain hundreds of tokens.
+    if (nt > 4) {
+        for (int t0 = 0; t0 < nt; t0 += 4) {
+            const int k = nt - t0 < 4 ? nt - t0 : 4;
+            iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
+        }
+        return;
+    }
+    const block_q8_0* y[4];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
     switch (nt) {
         case 1: iq4nl_rows<1>(w, row_bytes, n, y, out, r0, r1); break;
         case 2: iq4nl_rows<2>(w, row_bytes, n, y, out, r0, r1); break;
         case 3: iq4nl_rows<3>(w, row_bytes, n, y, out, r0, r1); break;
         case 4: iq4nl_rows<4>(w, row_bytes, n, y, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
-        }
+        default: break;
     }
 }
 

@@ -157,7 +157,8 @@ export function Sidebar({drawer, open}) {
   return html`<nav ref=${nav} class=${`side${drawer ? " side--drawer" : ""}`} aria-label="Mantiq" role=${shown ? "dialog" : undefined}
     aria-modal=${shown ? "true" : undefined} inert=${drawer && !open}>
     <div class="side__head" ref=${head}>
-      <span class="side__brand"><${MantiqMark}/><span>Mantiq</span></span>
+      <span class="side__brand"><${MantiqMark}/><span>Mantiq</span>${S.health.version
+        ? html`<span class="side__ver">v${S.health.version}</span>` : null}</span>
       ${drawer
         ? html`<button type="button" class="icon-btn" aria-label="Close the chats" onClick=${() => { S.drawer = false; emit(); }}><${Icon} name="close"/></button>`
         : html`<button type="button" class="icon-btn" aria-label="Close the sidebar" title="Close the sidebar" onClick=${() => setSide(false)}>

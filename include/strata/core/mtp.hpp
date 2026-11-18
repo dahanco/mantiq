@@ -157,7 +157,8 @@ private:
     uint64_t experts_bytes_ = 0;
     // plain path (qwen35moe): the experts keep the block's OWN GGUF blocks, so the grouped native kernel needs the
     // block types and one expert's blob size (`experts.txt` -> `native_expert_layout`).  -1/0 on the qwen4exp path.
-    int expert_gu_type_ = -1, expert_d_type_ = -1;
+    // gate and up may differ (native_experts.txt v5); a 4-field experts.txt leaves expert_up_type_ == expert_gu_type_.
+    int expert_gu_type_ = -1, expert_up_type_ = -1, expert_d_type_ = -1;
     uint64_t expert_blob_ = 0;
     bool want_lend_ = false;
     LendableArena experts_arena_;   ///< `experts_` when lendable (not ok: one cudaMalloc)

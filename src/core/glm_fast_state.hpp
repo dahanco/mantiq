@@ -353,18 +353,22 @@ private:
 // [off, off + len) of a shard into dst (O_DIRECT when the shard has a direct fd; see glm_fast_path.cu)
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst);
 
-// A layer's VRAM slot stride: the expert blob ([gate | up | down]) rounded up so that both matrices' block sizes and
+// A layer's VRAM slot stride: the expert blob ([gate | up | down]) rounded up so that every role's block size and
 // 16 bytes divide it - llama.cpp's MMQ addresses expert e of a pool partition as base + e * stride in WHOLE blocks,
 // so the prompt path multiplies the resident experts where they lie.
-inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
+inline size_t expert_stride(size_t blob, int gu_type, int up_type, int d_type) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
-    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
+    if (gu_type == strata::kernels::exl3::kTypeEXL3 || up_type == strata::kernels::exl3::kTypeEXL3 ||
+        d_type == strata::kernels::exl3::kTypeEXL3)
         return (blob + 255) / 256 * 256;
     size_t a = 16;
-    const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
+    // every role's block size has to divide the stride: a mixed-quant layer's gate, up and down may all differ
+    const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) up_type);
+    const size_t b3 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
     if (b2 > 0) a = std::lcm(a, b2);
+    if (b3 > 0) a = std::lcm(a, b3);
     return (blob + a - 1) / a * a;
 }
 
@@ -518,8 +522,10 @@ struct Glm5Model::FastState {
         const float* router_bias = nullptr;
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;
-        int gu_type = 0, d_type = 0;
-        size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        int gu_type = 0, up_type = 0, d_type = 0;
+        // gu_bytes: the gate region's per-expert bytes (= up_off); up_bytes: the up region's (= down_off - up_off);
+        // a mixed-quant layer (native_experts.txt v5) has up_type != gu_type, so the two differ
+        size_t blob = 0, down_off = 0, gu_bytes = 0, up_bytes = 0, dn_bytes = 0;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;

@@ -1568,19 +1568,28 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     {
         std::ifstream ne(pack_dir + "/native_experts.txt");
         std::string line;
+        bool ne_v5 = false;   // v5 rows carry gate, up and down types (a mixed-quant layer); v3/v4 one gu_type
         while (std::getline(ne, line)) {
-            if (line.empty() || line[0] == '#') continue;
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+                if (line.find("native experts v5") != std::string::npos) ne_v5 = true;
+                continue;
+            }
             std::istringstream ss(line);
-            long long il = -1, gu = 0, dt = 0, off = 0, b = 0;
-            if (!(ss >> il >> gu >> dt >> off >> b) || il < 0 || il >= L) continue;
+            long long il = -1, gu = 0, ut = 0, dt = 0, off = 0, b = 0;
+            const bool head = ne_v5 ? (bool) (ss >> il >> gu >> ut >> dt >> off >> b)
+                                    : (bool) (ss >> il >> gu >> dt >> off >> b);
+            if (!head || il < 0 || il >= L) continue;
+            if (!ne_v5) ut = gu;
             blob[(size_t) il] = (double) b;
-            stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) dt);
+            stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) ut, (int) dt);
         }
         for (const auto& kv : xtab.layers)
             if (kv.first >= 0 && kv.first < L) {
                 blob[(size_t) kv.first] = (double) kv.second.blob();
                 stride[(size_t) kv.first] = (double) glmfast::expert_stride(
-                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3);
+                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3,
+                    strata::kernels::exl3::kTypeEXL3);
             }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
@@ -1608,7 +1617,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
             mtp_dense_vram(findm, L, b, e2)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
-            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
+            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type,
+                                                                 (int) tu->type, (int) td->type);
             mtp_dense = (double) b;
             mtp = true;
         } else if (g.nextn > 0 && xtab.mats.count(P + "nextn.eh_proj.weight") && xtab.layers.count(L)) {
@@ -1624,6 +1634,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                 if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 4;
             blob[(size_t) L] = (double) xtab.layers.at(L).blob();
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) xtab.layers.at(L).blob(),
+                                                                 strata::kernels::exl3::kTypeEXL3,
                                                                  strata::kernels::exl3::kTypeEXL3,
                                                                  strata::kernels::exl3::kTypeEXL3);
             mtp_dense = d;
@@ -2565,7 +2576,8 @@ int32_t strata::core::Glm5Model::pool_evict(int cls) {
 
 void strata::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
     const auto& nl = pack_layers_[(size_t) layer];
-    const uint64_t gu_bytes = (uint64_t) nl.fmt.gu_row * (uint64_t) g_.n_ff_exp;   // one role
+    const uint64_t gu_bytes = (uint64_t) nl.fmt.gu_row * (uint64_t) g_.n_ff_exp;   // the gate region's bytes
+    const uint64_t up_bytes = (uint64_t) nl.fmt.up_row * (uint64_t) g_.n_ff_exp;   // the up region's (v5 may differ)
     const uint64_t dn_bytes = (uint64_t) nl.fmt.d_row * (uint64_t) g_.n_embd;
     const Shard& gs = pack_shards_[(size_t) nl.gate_shard];
     const Shard& us = pack_shards_[(size_t) nl.up_shard];
@@ -2601,8 +2613,8 @@ void strata::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
                 StageJob j;
                 j.src[0] = gs.base + nl.gate_off + (uint64_t) ids[i] * gu_bytes;
                 j.len[0] = gu_bytes;
-                j.src[1] = us.base + nl.up_off + (uint64_t) ids[i] * gu_bytes;
-                j.len[1] = gu_bytes;
+                j.src[1] = us.base + nl.up_off + (uint64_t) ids[i] * up_bytes;
+                j.len[1] = up_bytes;
                 j.src[2] = ds.base + nl.down_off + (uint64_t) ids[i] * dn_bytes;
                 j.len[2] = dn_bytes;
                 j.buf = stage_bufs_[(size_t) i];
@@ -2613,24 +2625,24 @@ void strata::core::Glm5Model::pool_ensure(int layer, const int* ids, int k) {
                     stage_cv_.notify_one();
                 }
                 staged_dst_[i] = dst;
-                staged_len_[i] = 2 * gu_bytes + dn_bytes;
+                staged_len_[i] = gu_bytes + up_bytes + dn_bytes;
             } else if (bounce_) {
                 // pinned staging (STRATA_GLM_BOUNCE=1): CPU into the ring, then one stream-ordered
                 // device copy per miss.  Left of the default path after two driver wedges on this
                 // host; the ring drains via the sync at the head of every pool_ensure.
                 uint8_t* b = bounce_ + (size_t) (bounce_i_++ % 24) * slot_bytes_;
                 std::memcpy(b, gs.base + nl.gate_off + (uint64_t) ids[i] * gu_bytes, gu_bytes);
-                std::memcpy(b + gu_bytes, us.base + nl.up_off + (uint64_t) ids[i] * gu_bytes, gu_bytes);
-                std::memcpy(b + 2 * gu_bytes, ds.base + nl.down_off + (uint64_t) ids[i] * dn_bytes, dn_bytes);
+                std::memcpy(b + gu_bytes, us.base + nl.up_off + (uint64_t) ids[i] * up_bytes, up_bytes);
+                std::memcpy(b + gu_bytes + up_bytes, ds.base + nl.down_off + (uint64_t) ids[i] * dn_bytes, dn_bytes);
                 cudaMemcpyAsync(dst, b, slot_bytes_, cudaMemcpyHostToDevice);
             } else {
                 // the verified phase-1 default: three stream-ordered copies out of the mmap'd
                 // shards (the roles share a shard but an expert's gate/up rows are not adjacent)
                 cudaMemcpyAsync(dst, gs.base + nl.gate_off + (uint64_t) ids[i] * gu_bytes, gu_bytes,
                                 cudaMemcpyHostToDevice);
-                cudaMemcpyAsync(dst + gu_bytes, us.base + nl.up_off + (uint64_t) ids[i] * gu_bytes, gu_bytes,
+                cudaMemcpyAsync(dst + gu_bytes, us.base + nl.up_off + (uint64_t) ids[i] * up_bytes, up_bytes,
                                 cudaMemcpyHostToDevice);
-                cudaMemcpyAsync(dst + 2 * gu_bytes, ds.base + nl.down_off + (uint64_t) ids[i] * dn_bytes, dn_bytes,
+                cudaMemcpyAsync(dst + gu_bytes + up_bytes, ds.base + nl.down_off + (uint64_t) ids[i] * dn_bytes, dn_bytes,
                                 cudaMemcpyHostToDevice);
             }
             ++pool_misses_;
@@ -2701,7 +2713,8 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
                 const float vb = 1.0f / (1.0f + std::exp(-lg_host[(size_t) b2])) + bias[b2];
                 return va > vb;
             });
-            const uint64_t gu_b = (uint64_t) nl.fmt.gu_row * (uint64_t) g.n_ff_exp;
+            const uint64_t gu_b = (uint64_t) nl.fmt.gu_row * (uint64_t) g.n_ff_exp;   // the gate region's bytes
+            const uint64_t up_b = (uint64_t) nl.fmt.up_row * (uint64_t) g.n_ff_exp;   // the up region's (v5 may differ)
             const uint64_t dn_b = (uint64_t) nl.fmt.d_row * (uint64_t) g.n_embd;
             const Shard& s1 = pack_shards_[(size_t) nl.gate_shard];
             const Shard& s2 = pack_shards_[(size_t) nl.up_shard];
@@ -2713,7 +2726,7 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
                     posix_fadvise(s1.fd, (off_t) (nl.gate_off + (uint64_t) e2 * gu_b), (off_t) gu_b,
                                   POSIX_FADV_WILLNEED);
                 if (s2.fd >= 0)
-                    posix_fadvise(s2.fd, (off_t) (nl.up_off + (uint64_t) e2 * gu_b), (off_t) gu_b,
+                    posix_fadvise(s2.fd, (off_t) (nl.up_off + (uint64_t) e2 * up_b), (off_t) up_b,
                                   POSIX_FADV_WILLNEED);
                 if (s3.fd >= 0)
                     posix_fadvise(s3.fd, (off_t) (nl.down_off + (uint64_t) e2 * dn_b), (off_t) dn_b,
@@ -2724,7 +2737,7 @@ bool strata::core::Glm5Model::pack_moe_tail_device(std::string& err, const std::
 #endif
     strata::kernels::quantize_q8_1_rows(A + sc_x, 1, g.n_embd, dev_xq_, nullptr);
     const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(
-        nl.fmt.gu_type, nl.fmt.d_type, g.n_embd, g.n_ff_exp);
+        nl.fmt.gu_type, nl.fmt.up_type, nl.fmt.d_type, g.n_embd, g.n_ff_exp);
     strata::kernels::native_expert_grouped(L, (const unsigned long long*) (plan_dev_ + offsetof(DevPlan, ptr)),
                                            (const int32_t*) (plan_dev_ + offsetof(DevPlan, start)),
                                            (const int32_t*) (plan_dev_ + offsetof(DevPlan, n_groups)),
@@ -2897,19 +2910,27 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     {
         std::ifstream ne(pack_dir + "/native_experts.txt");
         std::string line;
+        bool ne_v5 = false;   // v5 rows carry gate, up and down types (a mixed-quant layer); v3/v4 one gu_type
         while (std::getline(ne, line)) {
-            if (line.empty() || line[0] == '#') continue;
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+                if (line.find("native experts v5") != std::string::npos) ne_v5 = true;
+                continue;
+            }
             std::istringstream ss(line);
-            int layer = -1, gu = -1, dty = -1;
+            int layer = -1, gu = -1, ut = -1, dty = -1;
             uint64_t off = 0, blob = 0, go = 0, uo = 0, dof = 0;
-            ss >> layer >> gu >> dty >> off >> blob >> go >> uo >> dof;
+            const bool head = ne_v5 ? (bool) (ss >> layer >> gu >> ut >> dty >> off >> blob >> go >> uo >> dof)
+                                    : (bool) (ss >> layer >> gu >> dty >> off >> blob >> go >> uo >> dof);
+            if (!head) continue;
+            if (!ne_v5) ut = gu;   // v3/v4: gate and up share one type
             std::vector<std::string> names;
             std::string w;
             while (ss >> w) names.push_back(w);
             if (layer < 0 || layer >= g_.n_layers) continue;
             NativeLayer nl;
             nl.layer = layer;
-            if (!strata::kernels::cpu::native_fmt(gu, dty, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
+            if (!strata::kernels::cpu::native_fmt(gu, ut, dty, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
             nl.gate_off = go;
             nl.up_off = uo;
             nl.down_off = dof;
@@ -2941,7 +2962,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const char* role_tn[3] = {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
             const int role_sh[3] = {nl.gate_shard, nl.up_shard, nl.down_shard};
             const uint64_t role_of[3] = {nl.gate_off, nl.up_off, nl.down_off};
-            const int role_ty[3] = {gu, gu, dty};   // gate and up share one type; down is its own
+            const int role_ty[3] = {gu, ut, dty};   // gate and up may differ in a mixed-quant (v5) layer; down is its own
             for (int ri = 0; ri < 3; ++ri) {
                 const std::string rn = "blk." + std::to_string(layer) + "." + role_tn[ri];
                 const strata::TensorInfo* ti = gfs[(size_t) role_sh[ri]]->find(rn);
@@ -3512,14 +3533,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     //    the CPU native path (fallback + A/B).
     dev_experts_ = !fast_mode_ && getenv("STRATA_GLM_CPU_EXPERTS") == nullptr && g_.n_exp_used <= 8;
     if (dev_experts_) {
-        size_t gu_row_max = 0, d_row_max = 0;
+        size_t gu_row_max = 0, up_row_max = 0, d_row_max = 0;
         for (const auto& nl : pack_layers_) {
             if (nl.layer < 0) continue;
             gu_row_max = std::max(gu_row_max, nl.fmt.gu_row);
+            up_row_max = std::max(up_row_max, nl.fmt.up_row);   // v5: the up row may be larger than the gate's
             d_row_max = std::max(d_row_max, nl.fmt.d_row);
         }
-        slot_bytes_ = 2 * gu_row_max * (size_t) g_.n_ff_exp + d_row_max * (size_t) g_.n_embd;
-        // SIZE CLASSES: one class per distinct (gu_row, d_row).  Uniform slots at the largest blob
+        slot_bytes_ = (gu_row_max + up_row_max) * (size_t) g_.n_ff_exp + d_row_max * (size_t) g_.n_embd;
+        // SIZE CLASSES: one class per distinct (gu_row + up_row, d_row).  Uniform slots at the largest blob
         // pad ~20% of the arena (8.78 MB max vs 7.03 MB average on this pack); per-class sub-arenas
         // sized by layer-count-weighted demand recover it (~+25% slots).
         std::map<std::pair<size_t, size_t>, int> class_ids;
@@ -3528,11 +3550,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         std::vector<int> c_layers;
         for (const auto& nl : pack_layers_) {
             if (nl.layer < 0) continue;
-            const auto key = std::make_pair(nl.fmt.gu_row, nl.fmt.d_row);
+            const auto key = std::make_pair(nl.fmt.gu_row + nl.fmt.up_row, nl.fmt.d_row);
             auto it = class_ids.find(key);
             if (it == class_ids.end()) {
                 it = class_ids.emplace(key, (int) c_stride.size()).first;
-                c_stride.push_back(2 * nl.fmt.gu_row * (size_t) g_.n_ff_exp + nl.fmt.d_row * (size_t) g_.n_embd);
+                c_stride.push_back((nl.fmt.gu_row + nl.fmt.up_row) * (size_t) g_.n_ff_exp + nl.fmt.d_row * (size_t) g_.n_embd);
                 c_weight.push_back(0);
                 c_layers.push_back(0);
             }
@@ -3848,11 +3870,12 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     const strata::TensorInfo* tg = find(P + "ffn_gate_exps.weight", sg);
     const strata::TensorInfo* tu = find(P + "ffn_up_exps.weight", su);
     const strata::TensorInfo* td = find(P + "ffn_down_exps.weight", sd);
-    if (tg == nullptr || tu == nullptr || td == nullptr || tg->type != tu->type) {
-        err = "mtp: the draft block's routed experts are missing or mixed";
+    if (tg == nullptr || tu == nullptr || td == nullptr) {
+        err = "mtp: the draft block's routed experts are missing";
         return false;
     }
-    if (!strata::kernels::cpu::native_fmt((int) tg->type, (int) td->type, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
+    // gate and up may carry different types (native_experts.txt v5): native_fmt pins the shared activation format
+    if (!strata::kernels::cpu::native_fmt((int) tg->type, (int) tu->type, (int) td->type, g_.n_embd, g_.n_ff_exp, nl.fmt, err)) return false;
     nl.gate_shard = sg;
     nl.up_shard = su;
     nl.down_shard = sd;

@@ -974,7 +974,14 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 // indexer, so there is no raw key to project and no buffer to project it into.
 if (!no_indexer) project_bf16(x, b.x_bf16, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
-SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (!sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (!sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (!sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (!plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (!plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (!plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (!plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
+// **A NATIVELY SERVED PROJECTION HAS NO PLANES, AND ITS ROW LOOKS LIKE A ZERO-BYTE TENSOR.**  Under
+// `--native` the pack holds these four tensors only in their GGUF form: the loader skips them, `index.txt`
+// records `dst_bytes == 0`, and every plane byte count is zero.  `plane_ptrs` refuses such a row ("the planes
+// add up to 0 B but the tensor is 0 B") and `sform_of` would build a form out of zeroes.  `gemv_quantized`
+// reads exactly those tensors from `native_data` through `native_mmvq`, so the two builders are skipped for
+// them; `native_data != nullptr` is the engine's own test for "served natively" (`verify.cpp`'s `native_of`,
+// and `qwen35moe_prefill.cu`'s `proj`), and `gdn_layer` applies the same rule above.
+const auto canon = [](const WeightRef& w) { return w.native_data == nullptr; };    SForm f_k, f_v, f_o, f_q;    if (canon(*w_attnk) && !sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (canon(*w_attnv) && !sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (canon(*w_attno) && !sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (canon(*w_attnq) && !sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (canon(*w_attnk) && !plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (canon(*w_attnv) && !plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (canon(*w_attno) && !plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (canon(*w_attnq) && !plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
 // artifact, but the dispatch is here for the same reason it is in `gdn_layer`: the pack decides per tensor,
 // and "it happens to be uniform here" is the assumption that was wrong for `attn_q`.

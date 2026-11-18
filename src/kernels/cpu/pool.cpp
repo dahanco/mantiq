@@ -410,7 +410,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 // carries the contiguous `blob` with the pack's own offsets.  Both read the weights where they
                 // are; the difference is only that nothing was copied into a ring slot first.
                 const ExpertJobMulti& jb = mjobs_[e];
-                if (mode_ == 5 && nfmt_->gu_type == 42 && q2_own_kernels()) {
+                if (mode_ == 5 && nfmt_->gu_type == 42 && nfmt_->up_type == 42 && q2_own_kernels()) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
