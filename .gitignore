@@ -30,13 +30,9 @@ td.log
 /third_party/llama.cpp/
 /models/
 /packs/
-/models_cfg/packs/
 # the models this PC set up are this machine's, not the source's: a fresh checkout starts with an empty model list.
-# The shipped expert profiles (models_cfg/expert-profile-*.bin, the setup's own ranking of each architecture's experts)
-# stay tracked.
-/models_cfg/*.json
-/models_cfg/*.prev
-/models_cfg/token-savings.json*
+# The whole folder is the machine's: model configs, packs, token savings, and the expert profiles a pack builds or learns.
+/models_cfg/
 /mtp/
 /run-*.bat
 /run-*.sh
