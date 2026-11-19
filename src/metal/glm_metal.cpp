@@ -1013,6 +1013,8 @@ bool GlmMetal::forward(const std::vector<int32_t>& tokens, std::vector<float>& l
     }
     m.st.expert_hits = m.pool.hits;
     m.st.expert_misses = m.pool.misses;
+    m.st.ram_hits = m.pool.ram_hits;
+    m.st.ram_bytes = m.pool.ram_bytes();
     m.st.bytes_read = m.pool.bytes_read;
     m.st.io_seconds = m.pool.io_seconds;
     return true;
@@ -1037,6 +1039,8 @@ bool GlmMetal::forward_window(const std::vector<int32_t>& tokens, std::vector<fl
     m.st.tokens += (uint64_t) T;
     m.st.expert_hits = m.pool.hits;
     m.st.expert_misses = m.pool.misses;
+    m.st.ram_hits = m.pool.ram_hits;
+    m.st.ram_bytes = m.pool.ram_bytes();
     m.st.bytes_read = m.pool.bytes_read;
     m.st.io_seconds = m.pool.io_seconds;
     return true;

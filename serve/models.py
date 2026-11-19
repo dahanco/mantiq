@@ -11,6 +11,9 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              draft ("mtp" | "none"), mtp_drafts (the drafts its MTP offers a round, 1 by default), prompt_lookup
              (--suffix-draft, the prompt lookup), expert_cache, prefill, kv ("fp16" | "int8" |
              "k8v4" | "q4_0"), ram_gb (the experts' RAM tier, MNTQ_EXPERT_RAM_GB); no images (text only)
+             on the ggml engine's own builds (backend cpu / vulkan / metal: mntq-cpu, mntq-vulkan, Metal) the same two
+             drafting keys go to the environment instead - MNTQ_GLM_MTP_DECODE (1 on, 0 off), MNTQ_GLM_MTP_DRAFT (drafts
+             a round) and MNTQ_GLM_NO_MTP (1: the NextN block is not loaded at all, its memory left to the pool)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -252,6 +255,36 @@ def qwen_mtp(cfg: dict) -> Path | None:
     return None
 
 
+GGML_BACKENDS = ("metal", "cpu", "vulkan")   # the builds of src/metal's engine (mntq.py's is_ggml_engine)
+
+
+def ggml(cfg: dict) -> bool:
+    """True when this config runs on the ggml engine's own build (Metal, mntq-cpu, mntq-vulkan): it reads the GGUF file
+    itself and drafts with the NextN block the file carries, its keys the environment's (MNTQ_GLM_MTP_DECODE ...) - not
+    the CUDA / HIP engine's --mtp / --mtp-max-t, which it would read as flags it does not know and ignore."""
+    return cfg.get("backend") in GGML_BACKENDS
+
+
+_ggml_mtp: dict = {}
+
+
+def ggml_mtp(cfg: dict) -> bool:
+    """Whether the GGUF this config's ggml engine reads carries a NextN draft block (`nextn_predict_layers` > 0, the
+    same header check mntq.py's gguf_has_mtp makes before it builds a drafter): the MTP its settings can turn on.
+    False when the file is not there, or its header cannot be read; kept once read (a header read is not free)."""
+    gguf = flag(cfg.get("args") or [], "--gguf")
+    if not gguf or not Path(gguf).is_file():
+        return False
+    if gguf not in _ggml_mtp:
+        try:
+            from gguf_reader import GGUFFile                # (tools/, on the path above)
+            md = GGUFFile(gguf).metadata
+            _ggml_mtp[gguf] = int(md.get(f"{md.get('general.architecture', '')}.nextn_predict_layers") or 0) > 0
+        except Exception:   # noqa: BLE001 - a header it can't read: no MTP offered (not kept: it may still be arriving)
+            return False
+    return _ggml_mtp[gguf]
+
+
 def mm3_pack_has(cfg: dict, key: str) -> bool:
     """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
     tower - mntq.py's checks)."""
@@ -272,7 +305,8 @@ def choices(cfg: dict) -> dict:
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
     if family(cfg) == "qwen":                          # (images: the setup's mntq-vision entry, on or kept off)
-        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
+        can = ggml_mtp(cfg) if ggml(cfg) else qwen_mtp(cfg) is not None
+        return {"draft": ["mtp", "none"] if can else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
@@ -298,16 +332,28 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
         ram = mntq_names.lookup(env, "MNTQ_EXPERT_RAM_GB")
+        out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
+                   expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
+                   kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
+        if ggml(cfg):
+            # (the ggml engine drafts with the NextN block its GGUF carries; its keys are the environment's, not the CUDA
+            #  engine's --mtp / --mtp-max-t.  MNTQ_GLM_MTP_DECODE=0 or MNTQ_GLM_NO_MTP=1 is off - the latter also keeps
+            #  the block out of the model, its memory left to the expert pool.  Nothing set is the engine's own choice:
+            #  on where every expert is resident, and for a pool that streams, once most routed experts are; the page
+            #  shows it as on, and a change writes the value that decides.)
+            dec = mntq_names.lookup(env, "MNTQ_GLM_MTP_DECODE")
+            off = str(mntq_names.lookup(env, "MNTQ_GLM_NO_MTP", "") or "").strip() not in ("", "0")
+            out.update(draft="mtp" if ggml_mtp(cfg) and not off and _int(dec, 1) != 0 else "none",
+                       mtp_drafts=max(1, min(8, _int(mntq_names.lookup(env, "MNTQ_GLM_MTP_DRAFT"), 3) or 3)),
+                       prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0)
+            return out
         # (--mtp-max-t: the MTP's window, the pending token plus the drafts it offers, so one draft is 2 - the engine's
         # own default.  --suffix-draft: 3 by the engine, the prompt lookup on; a config that leaves the flag out drafts.)
         # (reading the engine's own default here matters: --add-local-model writes the flag out at all, so a 0 read it
         # as off and the page showed a model that drafts as one that does not - and saving that page wrote the 0 in)
-        out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
-                   draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
+        out.update(draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
                    mtp_drafts=max(1, _int(flag(args, "--mtp-max-t"), 2) - 1),
-                   prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0,
-                   expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
-                   kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
+                   prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0)
         return out
     if family(cfg) == "deepseek":
         dspark = flag(args, "--dspark")
@@ -416,22 +462,42 @@ def apply(cfg: dict, settings: dict) -> dict:
     reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam != "minimax" else None
     if fam == "qwen":
         if s.get("draft") not in can["draft"]:
-            raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
+            raise ValueError("Drafting: this model file carries no MTP (NextN) block"
+                             if s.get("draft") == "mtp" and ggml(cfg)
+                             else "Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
                              else "Drafting: MTP or none")
-        if qwen_mtp(cfg) is not None:   # (loaded either way - the server needs it; "none" keeps its drafts off)
-            args = set_flag(args, "--mtp", qwen_mtp(cfg))
-        # Drafting: the MTP offers --mtp-max-t - 1 drafts a round (the window is the pending token plus them), so N
-        # drafts is N + 1; off keeps the drafter loaded with its window at 1, no draft at all.  The engine caps the
-        # drafter only while --mtp-max-t is below --spec (generate.cpp: `S_mtp < o.spec`), and a window as wide as
-        # --spec would leave it at its one-draft default - so the verify cap is raised to fit the drafts asked for.
         drafts = int(_num(s, "mtp_drafts", 1, 8, "MTP drafts") or 1)
-        if s["draft"] == "mtp":
-            args = set_flag(args, "--mtp-max-t", drafts + 1)
-            spec = _int(flag(args, "--spec"), 0)
-            if spec and spec < drafts + 2:
-                args = set_flag(args, "--spec", drafts + 2)
+        if ggml(cfg):
+            # the ggml engine reads the GGUF itself: the CUDA engine's --mtp / --mtp-max-t mean nothing to it (it reads
+            # them as flags it does not know).  Its own keys are the environment's - MNTQ_GLM_MTP_DECODE=1 forces the
+            # NextN block to draft, MNTQ_GLM_MTP_DRAFT is how many a round, MNTQ_GLM_NO_MTP=1 keeps the block out of the
+            # model (off, and its memory left to the expert pool).
+            args = drop_flag(args, "--mtp")
+            args = drop_flag(args, "--mtp-max-t")
+            env2 = dict(out.get("env") or {})
+            for name in (*mntq_names.both_names("MNTQ_GLM_MTP_DECODE"), *mntq_names.both_names("MNTQ_GLM_MTP_DRAFT"),
+                         *mntq_names.both_names("MNTQ_GLM_NO_MTP")):
+                env2.pop(name, None)
+            if s["draft"] == "mtp":
+                env2[mntq_names.shown("MNTQ_GLM_MTP_DECODE")] = "1"
+                env2[mntq_names.shown("MNTQ_GLM_MTP_DRAFT")] = str(drafts)
+            else:
+                env2[mntq_names.shown("MNTQ_GLM_NO_MTP")] = "1"
+            out["env"] = env2
         else:
-            args = set_flag(args, "--mtp-max-t", 1)
+            if qwen_mtp(cfg) is not None:   # (loaded either way - the server needs it; "none" keeps its drafts off)
+                args = set_flag(args, "--mtp", qwen_mtp(cfg))
+            # Drafting: the MTP offers --mtp-max-t - 1 drafts a round (the window is the pending token plus them), so N
+            # drafts is N + 1; off keeps the drafter loaded with its window at 1, no draft at all.  The engine caps the
+            # drafter only while --mtp-max-t is below --spec (generate.cpp: `S_mtp < o.spec`), and a window as wide as
+            # --spec would leave it at its one-draft default - so the verify cap is raised to fit the drafts asked for.
+            if s["draft"] == "mtp":
+                args = set_flag(args, "--mtp-max-t", drafts + 1)
+                spec = _int(flag(args, "--spec"), 0)
+                if spec and spec < drafts + 2:
+                    args = set_flag(args, "--spec", drafts + 2)
+            else:
+                args = set_flag(args, "--mtp-max-t", 1)
         # the prompt lookup (--suffix-draft): on keeps a config's own shortest match (else the 4 the Qwen configs are
         # tuned to), off is --suffix-draft 0
         if not isinstance(s.get("prompt_lookup"), bool):
@@ -703,7 +769,12 @@ def machine_gpus(backend: str = "cuda") -> list:
     found = []
     try:
         import setup as SU                              # (the project's setup.py: nvidia-smi / the KFD topology)
-        raw = SU.amd_gpus() if backend == "hip" else SU.gpus()
+        if backend == "hip":
+            raw = SU.amd_gpus()
+        elif backend == "vulkan":                       # (ggml's Vulkan backend: the GPU's own driver, any make)
+            raw = SU.gpus() or SU.amd_gpus()
+        else:
+            raw = SU.gpus()
         found = [{"index": int(g["index"]), "name": g.get("name"), "vram_gb": g.get("vram_gb")} for g in raw or []]
     except (ImportError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         found = []

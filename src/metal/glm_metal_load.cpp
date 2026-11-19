@@ -98,6 +98,19 @@ struct Meta {
 // in it)
 size_t free_memory() { return plat::free_memory(); }
 
+namespace {
+
+// true when the expert pool lives in a card's own memory: the Vulkan build on a discrete GPU.  Metal's device is a GPU
+// type too, but on Apple silicon its memory IS the machine's RAM - the pool shares it with every other program, and so
+// does an integrated GPU's (the Vulkan backend reports those as an IGPU).  What differs is what the pool must leave
+// free: a RAM headroom where the OS lives in the same memory, the card's own driver and graph buffers where it does not.
+bool card_local_memory(ggml_backend_dev_t dev, const ggml_backend_dev_props& props) {
+    return props.type == GGML_BACKEND_DEVICE_TYPE_GPU &&
+           std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0;
+}
+
+}  // namespace
+
 GlmMetal::Impl::~Impl() {
     if (sched) ggml_backend_sched_free(sched);
     if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -357,6 +370,15 @@ bool Weights::load(const std::vector<std::pair<std::string, TensorLoc>>& tensors
     ggml_init_params ip{ggml_tensor_overhead() * (tensors.size() + 8), nullptr, true};
     ctx = ggml_init(ip);
     ParallelReader reader(io_threads);
+    // Metal wraps host memory with the tensor's own address; a device that cannot (Vulkan) gets real buffers and the
+    // bytes are read into a host section and copied in, one tensor at a time
+    bool host_ptr = true;
+    if (dev) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        host_ptr = props.caps.buffer_from_host_ptr;
+    }
+    std::vector<uint8_t> stage;
     size_t i = 0;
     while (i < tensors.size()) {
         size_t chunk = 0, j = i;
@@ -364,36 +386,52 @@ bool Weights::load(const std::vector<std::pair<std::string, TensorLoc>>& tensors
                (chunk == 0 || chunk + align_up(ggml_nbytes(tensors[j].second.meta), kAlign) <= kArenaChunk))
             chunk += align_up(ggml_nbytes(tensors[j++].second.meta), kAlign);
         chunk = align_up(chunk, plat::page_size());
-        void* m = host_alloc(chunk);
-        if (!m) {
-            err = "cannot allocate " + std::to_string(chunk >> 20) + " MiB for weights";
-            return false;
+        ggml_backend_buffer_t buf = nullptr;
+        char* base = nullptr;
+        if (dev && !host_ptr) {
+            buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), chunk);
+            base = buf ? (char*) ggml_backend_buffer_get_base(buf) : nullptr;
+        } else {
+            void* m = host_alloc(chunk);
+            if (!m) {
+                err = "cannot allocate " + std::to_string(chunk >> 20) + " MiB for weights";
+                return false;
+            }
+            mem.push_back({m, chunk});
+            host_pin(m, chunk);
+            buf = dev ? ggml_backend_dev_buffer_from_host_ptr(dev, m, chunk, chunk)
+                      : ggml_backend_cpu_buffer_from_ptr(m, chunk);
+            base = (char*) m;
         }
-        mem.push_back({m, chunk});
-        host_pin(m, chunk);
-        ggml_backend_buffer_t buf = dev ? ggml_backend_dev_buffer_from_host_ptr(dev, m, chunk, chunk)
-                                        : ggml_backend_cpu_buffer_from_ptr(m, chunk);
         if (!buf) {
             err = "the GPU could not map the weights";
             return false;
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         bufs.push_back(buf);
-        std::vector<ReadJob> jobs;
         size_t at = 0;
+        std::vector<ReadJob> jobs;
         for (; i < j; ++i) {
             const auto& [name, l] = tensors[i];
             ggml_tensor* t = ggml_dup_tensor(ctx, l.meta);
             ggml_set_name(t, name.c_str());
-            if (ggml_backend_tensor_alloc(buf, t, (char*) m + at) != GGML_STATUS_SUCCESS) {
+            if (ggml_backend_tensor_alloc(buf, t, base + at) != GGML_STATUS_SUCCESS) {
                 err = "cannot place " + name;
                 return false;
             }
-            jobs.push_back({l.fd, l.offset, (char*) m + at, ggml_nbytes(t)});
+            if (host_ptr || !dev) {
+                jobs.push_back({l.fd, l.offset, base + at, ggml_nbytes(t)});
+            } else {
+                const size_t n = ggml_nbytes(t);
+                if (stage.size() < n) stage.resize(n);
+                std::vector<ReadJob> one{{l.fd, l.offset, stage.data(), n}};
+                if (!reader.read(one, err)) return false;
+                ggml_backend_tensor_set(t, stage.data(), 0, n);
+            }
             by_name[name] = t;
             at += align_up(ggml_nbytes(t), kAlign);
         }
-        if (!reader.read(jobs, err)) return false;
+        if (!jobs.empty() && !reader.read(jobs, err)) return false;
         bytes += chunk;
     }
     return true;
@@ -525,43 +563,55 @@ bool GlmMetal::Impl::init_experts(std::string& err) {
     }
     size_t budget = o.expert_budget, cap = budget;
     if (budget == 0) {
-        // the RAM this machine must keep for itself, under the name the CUDA engine's RAM tier uses
-        // (MNTQ_GLM_RAM_HEADROOM_GB, default 6): unified memory is shared with every other program, and a pool past
-        // what is free gets compressed or swapped - a graph that reads it then stalls for seconds (measured: 20-57 s)
-        // instead of 10 ms.  The same headroom sets the ceiling (cap, below).
+        // Where the pool lives decides what it must leave free.  In unified memory (Apple silicon, an integrated GPU)
+        // it shares every byte with the OS and every other program, and a pool past what is free gets compressed or
+        // swapped - a graph that reads it then stalls for seconds (measured: 20-57 s) instead of 10 ms; there the
+        // headroom is large, MNTQ_GLM_RAM_HEADROOM_GB (default 6).  In a discrete card's VRAM the pool owns its
+        // memory and only the card's driver and the graph's own buffers must fit beside it, so a small headroom
+        // (default 1.5 GB) leaves the rest of the VRAM to the experts: the fixed 6 GB there cut an 8.6 GB card's pool
+        // to 1 GB (measured 10.2 tok/s, 57% of routed experts resident) where 4 GB holds 85% and runs at 20 tok/s.
+        ggml_backend_dev_props props{};
+        bool card_local = false;
+        if (gpu_dev) {
+            ggml_backend_dev_get_props(gpu_dev, &props);
+            card_local = card_local_memory(gpu_dev, props);
+        }
         const char* hv = std::getenv("MNTQ_GLM_RAM_HEADROOM_GB");
-        const double head_gb = hv && *hv ? std::atof(hv) : 6.0;
+        const double head_gb = hv && *hv ? std::atof(hv) : (card_local ? 1.5 : 6.0);
         const size_t head = (size_t) (head_gb * (double) (1ull << 30));
         // what may be kept resident, less the dense weights, the state and that headroom: the GPU's VRAM, or this
         // machine's whole RAM for the CPU backend - sized from the TOTAL, not from what is free now, because the OS
         // reclaims its cache for the pages a program writes.  Sizing from free memory would leave the pool short of
         // the expert set on a machine that holds it, and the graph is cut at every router unless EVERY expert has a
         // slot (15 graphs vs 615: measured 20.9 tok/s vs 7.5 on an i7-12700K with a 21.2 GB model in 32 GB).
-        size_t working = plat::total_memory();
-        if (gpu_dev) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(gpu_dev, &props);
-            working = props.memory_total;
-        }
+        const size_t working = gpu_dev ? props.memory_total : plat::total_memory();
+        // what is free NOW, in the pool's own memory: the card's VRAM when the pool lives there, else this machine's
+        const size_t avail_now = card_local ? props.memory_free : free_memory();
         const size_t reserve = st.dense_bytes + st.state_bytes + head;
         budget = working > reserve ? working - reserve : (size_t) 1 << 30;
         cap = budget;   // what the pool may grow to as memory frees up (GlmMetal::grow_pool)
         // a pool that cannot hold the whole expert set streams instead, and then it must stay within what is free
-        // now (less the same headroom): a streaming pool that oversubscribes would swap and stall all the same
+        // now: a streaming pool that oversubscribes would swap and stall all the same.  On a card the headroom above
+        // is already a margin of the card's whole memory - what is free now is the ceiling as it stands, and taking
+        // the headroom out again would count it twice (measured: it held the pool at 3.3 GB where 4.2 runs at 18 vs
+        // 10 tok/s).  In unified memory the headroom is what every other program shares, so it comes out of what is
+        // free now as well.
         if (total > budget) {
-            const size_t avail = free_memory();
-            const size_t fits = avail > head ? avail - head : 0;
+            const size_t fits = card_local ? avail_now : (avail_now > head ? avail_now - head : 0);
             if (fits < budget) {
-                std::fprintf(stderr, MNTQ_EXE_NAME ": %.1f GB free now (headroom %.0f GB): the expert pool takes %.1f GB, not %.1f\n",
-                             avail / 1e9, head_gb, fits / 1e9, budget / 1e9);
+                std::fprintf(stderr, MNTQ_EXE_NAME ": %.1f GB free now (headroom %.1f GB): the expert pool takes %.1f GB, not %.1f\n",
+                             avail_now / 1e9, head_gb, fits / 1e9, budget / 1e9);
                 budget = std::max(fits, (size_t) 1 << 30);
             }
         }
     }
     const int min_slots = g.n_expert + g.n_expert_used;   // one slice may touch every expert of a layer
-    if (!pool.init(layers, g.n_expert, min_slots, std::min(budget, total), std::min(cap, total), o.pool_slots, gpu_dev,
-                   o.io_threads,
-                   err))
+    // The host cache of the experts the pool evicts (--expert-ram-gb): a pool miss is then a memory copy, not an
+    // SSD read.  Off unless asked for - measured on an 8.6 GB card it does not help: a streaming pool's io is bound
+    // by the copy into VRAM (~9.5 GB at ~3.5 GB/s), not by the SSD read the cache removes (9.49 -> 2.03 GB left io
+    // and tok/s unchanged), so it only adds the second copy a miss then pays.
+    if (!pool.init(layers, g.n_expert, min_slots, std::min(budget, total), std::min(cap, total), o.pool_slots,
+                   o.expert_ram_bytes, gpu_dev, o.io_threads, err))
         return false;
     // the learned profile when there is one, else the shipped one: the pool starts with their first experts
     for (const std::string& path : {o.expert_profile_save, o.expert_profile}) {

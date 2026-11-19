@@ -526,12 +526,20 @@ struct Server {
         if (const size_t grown = model.grow_pool()) {   // memory freed since the start: more experts stay resident
             std::fprintf(stderr, MNTQ_EXE_NAME ": the expert pool grew by %.1f GB to %.1f GB\n", grown / 1e9,
                          model.stats().pool_bytes / 1e9);
-            // started short (a restart before the old engine's memory came back): MTP's default turns on once the
-            // pool holds every expert, as it would have at a start with that memory
-            if (mtp_auto && !mtp && model.pool_holds_all()) {
+        }
+        // MTP's default follows what the pool keeps, not only a pool that holds every expert: a verify window is worth
+        // it once most routed experts are resident (measured on Qwopus3.6-35B, 20.2 GB of experts in an 8.6 GB card:
+        // 85% hits +24%, 57% -5%).  The pool grows into freed memory first, so what counts is the rate this machine
+        // measured - from the second request on.
+        if (mtp_auto && !mtp) {
+            const GlmStats& rst = model.stats();
+            const uint64_t lookups = rst.expert_hits + rst.expert_misses;
+            const double hits = lookups ? (double) rst.expert_hits / (double) lookups : 0.0;
+            if (model.pool_holds_all() || hits >= 0.80) {
                 mtp = true;
                 mtp_len = std::make_unique<DraftLength>(mtp_draft_cap());
-                std::fprintf(stderr, MNTQ_EXE_NAME ": every expert has a slot now: MTP drafting is on\n");
+                std::fprintf(stderr, MNTQ_EXE_NAME ": the pool keeps %s (%.0f%% of the routed experts): MTP drafting is on\n",
+                             model.pool_holds_all() ? "every expert" : "most of them", hits * 100.0);
             }
         }
         std::string pe;   // this machine's expert usage, for the next start (after DONE: nobody waits on it)
@@ -571,16 +579,18 @@ int serve(GlmMetal& model, const std::vector<std::string>& args) {
     // MTP drafts by default only when every expert is resident: then a token is GPU work and a verify window writes
     // several for about the price of one.  With experts streamed from the SSD a window needs more of them than one
     // token (measured on Mantiq-S, 64 GB M4 Max: plain 7.3 tok/s, MTP 6.9 - the same tokens) - as the CUDA engine, whose
-    // MTP decode is on by default only where memory is unified and large.  MNTQ_GLM_MTP_DECODE=0/1 decides instead.
+    // MTP decode is on by default only where memory is unified and large.  A pool that keeps most routed experts is the
+    // case in between (measured on Qwopus3.6-35B: +24% at 85% hits): it turns on from the second request on, once the
+    // rate is measured (gen()'s tail).  MNTQ_GLM_MTP_DECODE=0/1 decides instead.
     const char* md = std::getenv("MNTQ_GLM_MTP_DECODE");
     const bool mtp_wanted = md && *md ? std::atoi(md) != 0 : model.stats().experts_all_resident;
     s.mtp = mtp_wanted && model.has_mtp() && std::getenv("MNTQ_GLM_NO_MTP") == nullptr &&
             std::getenv("MNTQ_GLM_NO_SPEC") == nullptr;
     s.mtp_auto = !(md && *md) && model.has_mtp() && std::getenv("MNTQ_GLM_NO_MTP") == nullptr &&
                  std::getenv("MNTQ_GLM_NO_SPEC") == nullptr;
-    if (model.has_mtp() && !s.mtp)
-        std::printf("NOTE MTP drafting is off (the experts stream from the SSD); MNTQ_GLM_NO_MTP=1 frees the NextN "
-                    "block's memory for the expert pool\n");
+    if (s.mtp_auto && !s.mtp)
+        std::printf("NOTE MTP drafting starts off (the experts stream from the SSD) and turns on once the measured hit "
+                    "rate reaches 80%%; MNTQ_GLM_NO_MTP=1 frees the NextN block's memory for the expert pool\n");
     if (s.mtp) s.mtp_len = std::make_unique<DraftLength>(mtp_draft_cap());
     const auto& st = model.stats();
     std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=%zu\n",

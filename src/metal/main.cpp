@@ -31,6 +31,9 @@ void usage() {
 #else
     const char* pool = "  --expert-gb X        unified memory for the routed-expert pool (default: what the GPU's\n"
                        "                       working set leaves after the dense weights and the cache)\n"
+                       "  --expert-ram-gb X    system RAM for the experts the pool evicts: a pool miss is then a memory\n"
+                       "                       copy, not an SSD read.  Off by default: measured not to help (the io of a\n"
+                       "                       streaming pool is bound by the copy into VRAM, not the SSD read)\n"
                        "  --kv-f16             MLA latent cache in F16 (half the bytes; default F32, F16 on the GPU)\n"
                        "  --kv-f32             keep the MLA latent cache F32 on the GPU too (MNTQ_METAL_KV_F32=1)\n";
 #endif
@@ -103,6 +106,7 @@ int main(int argc, char** argv) {
         else if (a == "--ubatch") o.n_ubatch = std::atoi(next());
         else if (a == "--attn-chunk") o.attn_chunk = std::atoi(next());
         else if (a == "--expert-gb") o.expert_budget = (size_t) (std::atof(next()) * 1e9);
+        else if (a == "--expert-ram-gb") o.expert_ram_bytes = (size_t) (std::atof(next()) * 1e9);
         else if (a == "--pool-slots") o.pool_slots = std::atoi(next());
         else if (a == "--io-threads") o.io_threads = std::atoi(next());
         else if (a == "--expert-profile") o.expert_profile = next();
@@ -160,7 +164,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     const double pp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-    std::printf("prompt %zu tokens in %.2f s (%.1f tok/s)\n", ids.size(), pp, ids.size() / pp);
+    const auto sp = model.stats();
+    std::printf("prompt %zu tokens in %.2f s (%.1f tok/s); %.2f GB read, io %.2f s, gpu %.2f s, host %.2f s "
+                "(%llu graphs)\n",
+                ids.size(), pp, ids.size() / pp, sp.bytes_read / 1e9, sp.io_seconds, sp.gpu_seconds,
+                sp.host_seconds, (unsigned long long) sp.graphs);
     std::vector<int32_t> out;
     t1 = std::chrono::steady_clock::now();
     const auto s0 = model.stats();
@@ -231,6 +239,7 @@ int main(int argc, char** argv) {
     std::printf("tokens:");
     for (int32_t t : out) std::printf(" %d", t);
     const uint64_t hits = s.expert_hits - s0.expert_hits, misses = s.expert_misses - s0.expert_misses;
+    const uint64_t ram = s.ram_hits - s0.ram_hits;
     if (rounds > 0)
         std::printf("\ndrafts: %d rounds, %d drafted, %d accepted (%.2f tokens a pass)", rounds, drafted, accepted,
                     (double) (accepted + rounds) / rounds);
@@ -239,5 +248,8 @@ int main(int argc, char** argv) {
                 n_gen, tg, (n_gen - 1) / tg, hits + misses ? 100.0 * hits / (hits + misses) : 100.0,
                 (s.bytes_read - s0.bytes_read) / 1e9, s.io_seconds - s0.io_seconds, s.gpu_seconds - s0.gpu_seconds,
                 s.host_seconds - s0.host_seconds, (unsigned long long) (s.graphs - s0.graphs));
+    if (misses > 0 && ram > 0)
+        std::printf("expert cache %.1f GB: %.1f%% of the misses served from memory (no SSD read)\n",
+                    s.ram_bytes / 1e9, 100.0 * ram / misses);
     return 0;
 }

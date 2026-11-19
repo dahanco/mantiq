@@ -3,7 +3,8 @@
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
-one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
+one conversation at a time; Vulkan: ggml's Vulkan backend on a GPU with no CUDA and no HIP, text only.
+DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
 and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-mntq-s,
 deepseek-mntq-xs, minimax-mntq-xs ... (tools/mntq_quants.py); every name used before still works.
@@ -918,7 +919,8 @@ def glm_expert_profile(pack: Path) -> Path:
 
 
 def ggml_expert_profile(gguf: Path, dst: Path) -> Path | None:
-    """The `--expert-profile` a ggml engine (Metal / the CPU engine) reads, kept at `dst` (the model's own folder).
+    """The `--expert-profile` a ggml engine (Metal / the CPU engine / the Vulkan engine) reads, kept at `dst` (the
+    model's own folder).
 
     These engines read the GGUF file itself, so the seed of first resort is the pack's own profile
     (glm_expert_profile / qwen_expert_profile over the pack both engines now share) and this is the fallback for
@@ -1171,21 +1173,29 @@ def fix_config_names(cfg: dict) -> bool:
     return done
 
 
-GGML_BACKENDS = ("metal", "cpu")   # the two builds of src/metal's engine: ggml's Metal backend, or ggml-cpu alone
+GGML_BACKENDS = ("metal", "cpu", "vulkan")   # the builds of src/metal's engine: ggml's Metal, CPU or Vulkan backend
 
 
 def is_ggml_engine(backend) -> bool:
-    """True for the ggml engine's own builds - Metal on Apple Silicon, or the CPU one (mntq-cpu).  Both read the GGUF
-    files themselves (no pack), run GLM's GGUF quants, read text only, and have no CPU lane for the CUDA tuning."""
+    """True for the ggml engine's own builds - Metal on Apple Silicon, the CPU one (mntq-cpu), or the Vulkan one
+    (mntq-vulkan, for a GPU with no CUDA and no HIP).  They read the GGUF files themselves (no pack), run GLM's GGUF
+    quants, read text only, and have no CPU lane for the CUDA tuning."""
     return backend in GGML_BACKENDS
 
 
-BUILD_DIRS = {"hip": "build-hip", "metal": "build-metal", "cpu": "build-cpu"}   # (CUDA: "build")
+def ggml_engine_label(backend) -> str:
+    """How the messages name this ggml engine's build."""
+    return {"cpu": "the CPU engine", "vulkan": "the Vulkan engine"}.get(backend, "Metal")
+
+
+BUILD_DIRS = {"hip": "build-hip", "metal": "build-metal", "cpu": "build-cpu",
+              "vulkan": "build-vulkan"}                            # (CUDA: "build")
 
 
 def engine_name(backend: str) -> str:
     """The engine binary's file name under its backend's build folder."""
-    return {"metal": "mntq-metal", "cpu": "mntq-cpu.exe" if WIN else "mntq-cpu"}.get(
+    return {"metal": "mntq-metal", "cpu": "mntq-cpu.exe" if WIN else "mntq-cpu",
+            "vulkan": "mntq-vulkan.exe" if WIN else "mntq-vulkan"}.get(
         backend, "mntq.exe" if WIN else "mntq")
 
 
@@ -1209,7 +1219,7 @@ def built_backend() -> str | None:
     """The backend whose engine this tree already carries, or None when it carries none.  A download that ships the
     engine runs that one: guessing this PC's fastest backend instead (CUDA on any PC with a card) made the portable
     CPU install's "Add Local Model" compile a second engine from source - in a tree with no llama.cpp to build from."""
-    return next((b for b in ("cuda", "hip", "metal", "cpu") if engine_built(b)), None)
+    return next((b for b in ("cuda", "hip", "metal", "cpu", "vulkan") if engine_built(b)), None)
 
 
 def hip_unified_memory(g) -> bool:
@@ -1620,6 +1630,120 @@ def check_cpu_pc(a) -> dict:
     return {"backend": "cpu", "gpus": []}
 
 
+def vulkan_loader() -> str | None:
+    """This PC's Vulkan loader, or None.  The GPU's own driver installs vulkan-1.dll on Windows (NVIDIA, AMD and Intel
+    each ship it); on Linux it is libvulkan.so.1, the loader package the driver's ICD plugs into."""
+    if WIN:
+        dll = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "vulkan-1.dll"
+        return str(dll) if dll.exists() else None
+    for p in ("/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/usr/lib64/libvulkan.so.1", "/usr/lib/libvulkan.so.1",
+              "/usr/lib/aarch64-linux-gnu/libvulkan.so.1", "/usr/lib/i386-linux-gnu/libvulkan.so.1"):
+        if Path(p).exists():
+            return p
+    return None
+
+
+def vulkan_sdk() -> Path | None:
+    """The Vulkan SDK's root, which a build from source needs: $VULKAN_SDK, else the newest C:\\VulkanSDK\\<version>
+    (Windows).  None: a Linux distribution whose own Vulkan headers, vulkan-1 library and glslc are installed -
+    find_package finds those without a root."""
+    env = os.environ.get("VULKAN_SDK")
+    if env and Path(env).is_dir():
+        return Path(env)
+    if WIN and Path("C:/VulkanSDK").is_dir():
+        roots = [p for p in Path("C:/VulkanSDK").iterdir() if (p / "Include" / "vulkan").is_dir()]
+        if roots:
+            return max(roots, key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)] or [0])
+    return None
+
+
+def vulkan_glslc(sdk: Path | None) -> Path | None:
+    """The glslc that compiles ggml's Vulkan shaders: the SDK's bin/glslc (Bin\\glslc.exe on Windows), or the one on
+    PATH when there is no SDK root."""
+    if sdk:
+        glslc = sdk / "Bin" / "glslc.exe" if WIN else sdk / "bin" / "glslc"
+        if glslc.exists():
+            return glslc
+    found = shutil.which("glslc")
+    return Path(found) if found else None
+
+
+def check_vulkan_pc(a) -> dict:
+    """The Vulkan backend's PC check: the GPU driver's Vulkan loader, a C++ compiler, CMake, RAM and free disk - and the
+    Vulkan SDK when the engine has to be built (glslc compiles ggml's shaders).  No GPU of a particular make is asked
+    for: mntq-vulkan is the same engine as mntq-cpu, on ggml's Vulkan backend, for a GPU with no CUDA (and no HIP) -
+    text only, GLM-5.3-Flash's GGUF quants."""
+    ok("the Vulkan engine (mntq-vulkan): ggml's Vulkan backend on this PC's GPU - text only, GLM-5.3-Flash's GGUF quants")
+    if a.gpus or a.gpu is not None:
+        warn("--gpu / --gpus do not apply: the Vulkan engine runs on the device ggml picks")
+    problems = []
+    engine = ROOT / "build-vulkan" / ("mntq-vulkan.exe" if WIN else "mntq-vulkan")
+    loader = vulkan_loader()
+    if loader is None:
+        problems.append(("no Vulkan loader (the GPU's driver installs it)",
+                         "install your GPU's current driver (NVIDIA, AMD or Intel: each one ships Vulkan), restart, "
+                         f"and run {ME} again"))
+    else:
+        ok("Vulkan loader: " + loader)
+    try:
+        cards = [g["name"] for g in (S.gpus() or [])] or [g["name"] for g in (S.amd_gpus() or [])]
+    except Exception:  # noqa: BLE001 - no GPU tool answered: the loader is what the check needs
+        cards = []
+    if cards:
+        ok("GPU: " + ", ".join(cards))
+    if engine.exists():
+        ok("Vulkan SDK: not needed (mntq-vulkan is already compiled)")
+    else:
+        sdk = vulkan_sdk()
+        if vulkan_glslc(sdk) is None:
+            problems.append(("no Vulkan SDK (glslc, the Vulkan headers and vulkan-1 are what the build needs)",
+                             "install LunarG's SDK from https://vulkan.lunarg.com (its installer sets VULKAN_SDK), "
+                             "then run again"))
+        else:
+            ok(f"Vulkan SDK: {sdk or 'glslc found on PATH'}")
+    if WIN:
+        if S.find_vcvars(cuda=False) is None:
+            if engine.exists():                        # (a package that ships the compiled engine needs no compiler)
+                ok("C++ compiler: not needed (mntq-vulkan is already compiled)")
+            else:
+                problems.append(("no Visual Studio C++ compiler (the Build Tools with 'Desktop development with C++')",
+                                 "install the Visual Studio Build Tools, then run again"))
+        else:
+            ok("C++ compiler: Visual Studio's (found vcvars64.bat)")
+    else:
+        cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+        if cxx is None:
+            problems.append(("no C++ compiler", "install a C++ toolchain (g++ or clang++)"))
+        else:
+            ok("C++ compiler: " + (S.out([cxx, "--version"]).splitlines() or [cxx])[0])
+    sc = pick_cmake() or shutil.which("cmake")
+    scv = tool_version(sc) if sc else (0, 0)
+    if scv >= (3, 24):
+        ok(f"CMake {scv[0]}.{scv[1]}")
+    else:
+        ok((f"CMake {scv[0]}.{scv[1]} is older than 3.24" if sc else "no CMake on PATH") +
+           ": a current one goes into .venv in step 3 (pip)")
+    ok(f"Python {sys.version.split()[0]} ({sys.prefix})")
+    total, avail = mem_gb()
+    ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
+    if total < 100:
+        warn(f"the model is about 95-100 GB (Mantiq-S) and this PC has {total:.0f} GB of RAM: the routed experts stream "
+             "from the SSD while it answers, so decode speed is limited by the SSD")
+    free = shutil.disk_usage(ROOT).free / 1e9
+    if free < 5:
+        problems.append((f"only {free:.0f} GB free disk in {ROOT}: the engine's build needs a few GB", "free some space"))
+    else:
+        ok(f"free disk: {free:.0f} GB here")
+    if problems:
+        say()
+        for what, how in problems:
+            say(f"  [X] {what}")
+            say(f"      {how}")
+        fail("something Mantiq needs is missing (above)", f"install it and run {ME} again - the script installs nothing system-wide")
+    select_build_backend("vulkan")
+    return {"backend": "vulkan", "gpus": []}
+
+
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
     lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
@@ -1771,6 +1895,11 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
             fail(f"Mantiq's CPU engine runs GLM-5.3-Flash and Qwen3.5/3.6-MoE only (no CPU engine for {ds4 and DS4 or mm3 and MM3})",
                  "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_cpu_pc(a)
+    if a.backend == "vulkan":
+        if family not in ("glm", "qwen"):
+            fail(f"Mantiq's Vulkan engine runs GLM-5.3-Flash and Qwen3.5/3.6-MoE only (no Vulkan engine for {ds4 and DS4 or mm3 and MM3})",
+                 "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
+        return check_vulkan_pc(a)
     if ds4 and not gguf and S.ARM:
         # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
         fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
@@ -2004,7 +2133,8 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     memory: DFlash2 passes; --bench decode +9% against the MTP block, the speed calibration +5%).  So do NVIDIA
     GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU and two).  A
     DFlash2 answer is then checked on this PC by the speed calibration (speed_calibration): it stays only where it is
-    faster.  On Metal both are exact and neither is measured: MTP is the default, the choice is yours."""
+    faster.  On the ggml engines (Metal, the CPU engine and the Vulkan engine) both are exact and neither is measured:
+    MTP is the default, the choice is yours."""
     if getattr(a, "draft", None):
         return a.draft
     gpus = pc.get("gpus") or []
@@ -2024,7 +2154,8 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
             (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
              "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
              + ("same answers either way. Not measured on a Mac: which one is faster is yours to try. " if metal else
-             "same answers either way. Not measured on the CPU engine: which one is faster is yours to try. " if ggml else
+             "same answers either way. Not measured on " + ggml_engine_label(pc.get("backend")) +
+             ": which one is faster is yours to try. " if ggml else
              "same answers, faster. Mantiq-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
              "calibration then measures it against the MTP block on this PC (5-20 minutes) and keeps it only if it "
              "is faster here. ") + f"The drafter's license is {DFLASH['license']}: non-commercial use only.")]
@@ -2069,7 +2200,7 @@ def choose_family(a, prev: dict) -> tuple:
             return "qwen", QWEN_DISTILL
         return ("qwen", "q5_k_m") if a.model == QWEN else ("glm", None)
     metal = is_ggml_engine(getattr(a, "backend", None))
-    if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal / the CPU engine: GLM only, no question)
+    if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (the ggml engines: GLM only, no question)
         return "glm", None
     if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
         return (exl3_folder_family(a.model_dir) or "deepseek"), None
@@ -2134,7 +2265,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
     GLM-5.3-Flash."""
     metal = is_ggml_engine(getattr(a, "backend", None))
-    ggml_where = "the CPU engine" if getattr(a, "backend", None) == "cpu" else "Metal"
+    ggml_where = ggml_engine_label(getattr(a, "backend", None))
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
             fail("an EXL3 quant runs on NVIDIA GPUs only", f"a GGUF quant runs on {ggml_where}: {ME} --setup --model {next(iter(MODELS))}")
@@ -2540,6 +2671,40 @@ def compile_engine_cpu(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
+def compile_engine_vulkan(llama: Path, src: str, soft=False) -> dict | None:
+    """`mntq-vulkan`: the same engine as mntq-cpu and mntq-metal, on ggml's Vulkan backend (MNTQ_ENABLE_VULKAN,
+    cmake/vulkan_backend.cmake) in build-vulkan/ - for a GPU with no CUDA (and no HIP); the commands are printed as
+    they run.  soft: a failure warns and returns None (the engine compiled before keeps working) instead of stopping."""
+    cmake = pick_cmake()
+    if cmake is None:
+        fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
+    gen = cached_generator()
+    ninja = venv_tool("ninja") or shutil.which("ninja")
+    conf = [cmake]
+    if ninja and gen in (None, "Ninja"):
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    conf += ["-S", str(ROOT), "-B", str(BUILD), "-DMNTQ_ENABLE_VULKAN=ON",
+             f"-DMNTQ_GGML_DIR={llama}", "-DCMAKE_BUILD_TYPE=Release"]
+    env = dict(os.environ)
+    sdk = vulkan_sdk()
+    if sdk:                                            # find_package(Vulkan), in ggml's own CMakeLists, reads it
+        env["VULKAN_SDK"] = str(sdk)
+    say("  Compiling Mantiq for this PC's GPU (ggml's Vulkan backend: no CUDA, no HIP) ... (a few minutes first time)")
+    vcvars = S.find_vcvars(cuda=False) if WIN else None
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "mntq-vulkan", "-j", str(os.cpu_count() or 4)],
+                   env, "build-mntq-vulkan.bat", vcvars=vcvars):
+        if soft:
+            warn("the Vulkan engine's rebuild failed; starting the previous engine")
+            return None
+        fail("the Vulkan engine build failed",
+             "see the compiler output above (glslc and the Vulkan headers are the SDK's: https://vulkan.lunarg.com)")
+    meta = {"backend": "vulkan", "src": src, "llama": str(llama), "version": mntq_version(),
+            "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["mntq-vulkan"]}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
 def build_step(a, pc, llama: Path, target: str = "mntq") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
@@ -2555,6 +2720,11 @@ def build_step(a, pc, llama: Path, target: str = "mntq") -> dict:
             ok(f"CPU engine already compiled: {exe}")
             return meta
         return compile_engine_cpu(llama, src)
+    if pc.get("backend") == "vulkan":
+        if exe.exists() and not a.rebuild and meta.get("backend") == "vulkan" and meta.get("src") == src:
+            ok(f"Vulkan engine already compiled: {exe}")
+            return meta
+        return compile_engine_vulkan(llama, src)
     if pc.get("backend") == "hip":
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
                 and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
@@ -2583,9 +2753,9 @@ def refresh_engine(cfg: dict) -> None:
     if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
-    # (a ggml backend's build folder holds one engine only, and its stamp names that engine mntq-cpu / mntq-metal:
-    # the targets check below is the CUDA / HIP one - applying it here rebuilt the ggml engine at every start, and in
-    # a package that ships it compiled, without llama.cpp's source, that rebuild only warned)
+    # (a ggml backend's build folder holds one engine only, and its stamp names that engine mntq-cpu / mntq-metal /
+    # mntq-vulkan: the targets check below is the CUDA / HIP one - applying it here rebuilt the ggml engine at every
+    # start, and in a package that ships it compiled, without llama.cpp's source, that rebuild only warned)
     if meta.get("src") == src and (cfg.get("backend") in GGML_BACKENDS or target in (meta.get("targets") or ["mntq"])):
         return
     if cfg.get("backend") == "hip":
@@ -2613,6 +2783,13 @@ def refresh_engine(cfg: dict) -> None:
             warn("llama.cpp's source is missing; starting the previous engine")
             return
         compile_engine_cpu(llama, src, soft=True)
+        return
+    if cfg.get("backend") == "vulkan":
+        llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
+        if not (llama / "ggml/CMakeLists.txt").exists():
+            warn("llama.cpp's source is missing; starting the previous engine")
+            return
+        compile_engine_vulkan(llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
@@ -3242,7 +3419,7 @@ def migrate_glm_pack(cfg: dict, cfg_path: Path) -> bool:
         return False
     args = cfg.get("args") or []
     if "--glm-pack" not in args[:-1]:
-        return False                                   # (no pack: Metal / the CPU engine)
+        return False                                   # (no pack: the ggml engines)
     old = Path(flag_value(args, "--glm-pack"))
     named = N.lookup(cfg.get("env") or {}, "MNTQ_GLM_SHARD_DIR")
     new = glm_pack_home(cfg, cfg_path)
@@ -3274,7 +3451,7 @@ def migrate_glm_profile(cfg: dict, cfg_path: Path) -> bool:
     if config_family(cfg) != "glm":
         return False
     args = cfg.get("args") or []
-    pack = flag_value(args, "--glm-pack")              # (Metal / the CPU engine: no pack, the shipped file stays)
+    pack = flag_value(args, "--glm-pack")              # (the ggml engines: no pack, the shipped file stays)
     if pack is None:
         return False
     pack = Path(pack)
@@ -3613,8 +3790,8 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     first start how much that is on this GPU (serve/server.py, vision_footprint).  On a Mac (Metal: one memory, no
     lending) it stays resident beside the model."""
     step(7, "images (the vision encoder)")
-    if pc.get("backend") == "cpu":
-        ok("skipped: the CPU engine reads text only (no vision encoder is built for it)")
+    if pc.get("backend") in ("cpu", "vulkan"):
+        ok(f"skipped: {ggml_engine_label(pc['backend'])} reads text only (no vision encoder is built for it)")
         return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
@@ -3755,7 +3932,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                  shards_dir: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 7711
-    metal = is_ggml_engine(pc.get("backend"))   # Metal or the CPU engine: ggml reads the GGUF files itself
+    metal = is_ggml_engine(pc.get("backend"))   # a ggml engine: ggml reads the GGUF files itself
     # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
     # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --expert-cache-per-layer is NOT passed here: it makes `slots_ / n_layers` leave a remainder, so the pool is
@@ -3776,7 +3953,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["args"] += ["--kv", MODELS[quant]["kv"]]
     # the expert profile both engines read and write, kept inside the pack (<pack>/expert-profile.bin, as a qwen35moe
     # pack's and DeepSeek's are): --expert-profile names it and --expert-profile-save rewrites it after each request -
-    # the CPU engine reads {save, profile} and the CUDA one the same, so a start reads back what the last request
+    # the ggml engines read {save, profile} and the CUDA one the same, so a start reads back what the last request
     # learned.  glm_expert_profile seeds a pack with no profile of its own from the shipped family ranking
     # (models_cfg/expert-profile-glm.bin) when it is of this pack's geometry; a pack it does not fit (a pruned model -
     # RCO-152E keeps 152 a layer) starts from an empty interleaved one and learns this PC's routing, because the engine
@@ -3839,7 +4016,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
-    suffix = {"hip": "-hip", "metal": "-metal", "cpu": "-cpu"}.get(pc.get("backend"), "")
+    suffix = {"hip": "-hip", "metal": "-metal", "cpu": "-cpu", "vulkan": "-vulkan"}.get(
+        pc.get("backend"), "")
     # the config lives beside the other models' (models_cfg), as Qwen's and the models of the user's own do, and is
     # named after the model: the GGUF file's own name (glm_model_name), else the quant's short id (an EXL3 folder)
     cfg_path = ROOT / "models_cfg" / f"mntq-{glm_model_name(gguf) or quant.lower()}{suffix}.json"
@@ -3993,7 +4171,7 @@ def profile_experts(path) -> int | None:
 def add_profile(cfg: dict) -> bool:
     """A config with no --expert-profile (written before setup passed one) gets its profile, as a setup would write
     it: an update restarts the installed config without setting up again.  A pack config takes its pack's profile;
-    a --gguf one (Metal / the CPU engine, which read the model file itself and have no pack) has its model's own
+    a --gguf one (the ggml engines, which read the model file itself and have no pack) has its model's own
     interleaved profile written where its --expert-profile-save looks for it, so the engine reads a ranking at load
     instead of rewriting an empty order (a 24-byte file) after every request.  True when `cfg` changed."""
     args = cfg.get("args")
@@ -4244,6 +4422,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     if cfg.get("backend") == "cpu":
         warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the CPU engine")
         return False
+    if cfg.get("backend") == "vulkan":
+        warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Vulkan engine")
+        return False
     busy = busy_gpus(cfg)
     if busy:
         warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
@@ -4396,6 +4577,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return False
     if cfg.get("backend") == "cpu":                    # (the CPU engine: MTP or DFlash2 is the user's choice too)
         return False
+    if cfg.get("backend") == "vulkan":                 # (as the CPU engine: MTP or DFlash2 is the user's choice too)
+        return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: measured at its setup, or --speed-calibration)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
@@ -4417,6 +4600,10 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if cfg.get("backend") == "cpu":
         warn("no speed calibration on the CPU engine: MTP and DFlash2 are both exact, which is faster here is your "
+             f"choice ({ME} --setup --draft mtp|dflash2)")
+        return False
+    if cfg.get("backend") == "vulkan":
+        warn("no speed calibration on the Vulkan engine: MTP and DFlash2 are both exact, which is faster here is your "
              f"choice ({ME} --setup --draft mtp|dflash2)")
         return False
     if config_family(cfg) == "qwen":                   # (the MTP drafter in the pack, or none)
@@ -4769,7 +4956,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     ds4 = config_family(cfg) == "deepseek"
     metal = is_ggml_engine(cfg.get("backend"))
     flag = "--gguf" if metal else ("--glm-pack" if config_family(cfg) == "glm" else "--pack")  # (mntq-ds4/mntq-mm3: --pack)
-    pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal / the CPU engine: the first GGUF file)
+    pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (the ggml engines: the first GGUF file)
     for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the model's GGUF file" if metal else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
@@ -5212,6 +5399,14 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         add("GPUs", S.out(["system_profiler", "SPDisplaysDataType"]) or "system_profiler did not answer")
     elif backend == "cpu":
         add("GPUs", "none: the CPU engine (mntq-cpu) runs on ggml's CPU backend")
+    elif backend == "vulkan":
+        # the Vulkan engine runs on the device ggml picks: the GPU's own driver is what answers here, so any make
+        try:
+            cards = [g["name"] for g in (S.gpus() or [])] or [g["name"] for g in (S.amd_gpus() or [])]
+        except Exception:  # noqa: BLE001 - no GPU tool answered: say so instead of the cards
+            cards = []
+        add("GPUs", ", ".join(cards) if cards else
+            "not listed here: the Vulkan engine (mntq-vulkan) runs on the device ggml picks")
     else:
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
@@ -5430,8 +5625,8 @@ def bench(cfg_path: Path, version: str) -> int:
         by_index = {g["index"]: g for g in found}
         found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
     gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or (
-        "the Apple GPU (Metal)" if cfg.get("backend") == "metal" else
-        "the CPU (mntq-cpu)" if cfg.get("backend") == "cpu" else "?")
+        {"metal": "the Apple GPU (Metal)", "cpu": "the CPU (mntq-cpu)",
+         "vulkan": "this PC's GPU (ggml's Vulkan backend)"}.get(cfg.get("backend"), "?"))
     total, _ = mem_gb()
     lines = [f"Mantiq v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
              f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
@@ -5536,14 +5731,15 @@ def set_up(a, prev: dict) -> Path | None:
     d, shards, quant = got
     dflash = drafter_step(models) if draft == "dflash2" else None
     # 6: the pack every engine reads its model through - models_cfg/packs/<the model>, the same files whether the
-    # CUDA / HIP engine loads it (--glm-pack) or the CPU / Metal one reads the GGUF files themselves and takes only
+    # CUDA / HIP engine loads it (--glm-pack) or the ggml ones read the GGUF files themselves and take only
     # its tokenizer and its expert-profile.bin from there
     pack = pack_step(a, d, shards, llama, quant)
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash,
                             shards[0], d)   # 8   (gguf: the model's first file - Metal runs it, every engine names the config after it)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: here the choice is yours)
-        ok("DFlash2 drafts on the " + ("CPU engine" if pc["backend"] == "cpu" else "Mac") +
+        ok("DFlash2 drafts on the " + ("CPU engine" if pc["backend"] == "cpu" else
+                                       "Vulkan engine" if pc["backend"] == "vulkan" else "Mac") +
            ", not measured against the MTP block (both are exact): "
            f"{ME} --setup --draft mtp goes back")
     elif dflash is not None:                           # DFlash2: kept only if it makes THIS PC faster (measured)
@@ -5562,8 +5758,7 @@ def set_up(a, prev: dict) -> Path | None:
              and saved_calibration(cfg, any_context=True) is None
              and not a.yes and not a.no_start)
     if metal and a.calibrate:
-        warn("--calibrate does not apply to " + ("the CPU engine" if pc["backend"] == "cpu" else "Metal") +
-             ": there is no CPU lane to tune")
+        warn("--calibrate does not apply to " + ggml_engine_label(pc["backend"]) + ": there is no CPU lane to tune")
     if (a.calibrate and not metal) or (offer and ask(
             "Tune Mantiq for this PC now? It measures the split of the work between the CPU and the PCIe link and the "
             "CPU threads (about 10-15 minutes; later: ./mntq.sh --calibrate)", ["y", "n"], "y", a.yes) == "y"):
@@ -7572,7 +7767,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         #  every flag written below - --pack, --native, --mtp - is one it takes.  mntq-metal and mntq-cpu read the
         #  GGUF themselves (--gguf), so a Qwen MoE file of the user's own is added on them instead)
         fail(f"{QWEN_SHOWN} runs on Mantiq's CUDA or HIP engine only: its pack and its MTP drafter are that engine's",
-             f"on {'the CPU engine' if a.backend == 'cpu' else 'Metal'} add a Qwen3.5/3.6-MoE GGUF file you already "
+             f"on {ggml_engine_label(a.backend)} add a Qwen3.5/3.6-MoE GGUF file you already "
              f"have instead: {ME} --add-local-model <file.gguf>")
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
@@ -7777,7 +7972,7 @@ def set_up_qwen_moe(a, prev: dict, model: str) -> Path | None:
     if is_ggml_engine(a.backend):
         # (as set_up_qwen: the pack, the MTP drafter and the flags written below are the CUDA/HIP engine's formats)
         fail(f"{e['shown']} runs on Mantiq's CUDA or HIP engine only: its pack and its MTP drafter are that engine's",
-             f"on {'the CPU engine' if a.backend == 'cpu' else 'Metal'} add a Qwen3.5/3.6-MoE GGUF file you already "
+             f"on {ggml_engine_label(a.backend)} add a Qwen3.5/3.6-MoE GGUF file you already "
              f"have instead: {ME} --add-local-model <file.gguf>")
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
@@ -8095,10 +8290,11 @@ def main() -> int:
     N.alias_env(os.environ)   # (MNTQ_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--backend", choices=["cuda", "hip", "metal", "cpu"],
+    ap.add_argument("--backend", choices=["cuda", "hip", "metal", "cpu", "vulkan"],
                     help="engine backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: "
                          "experimental, Apple Silicon Macs, text only; CPU: ggml's CPU backend alone, no GPU needed, "
-                         "text only, GLM-5.3-Flash's GGUF quants; the default on a Mac)")
+                         "text only, GLM-5.3-Flash's GGUF quants; Vulkan: ggml's Vulkan backend on the GPU of a PC "
+                         "with no CUDA and no HIP, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
@@ -8260,7 +8456,7 @@ def main() -> int:
     if a.backend:
         have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
     elif have:
-        a.backend = read_json(have[0]).get("backend") if read_json(have[0]).get("backend") in ("hip", "metal", "cpu") else "cuda"
+        a.backend = read_json(have[0]).get("backend") if read_json(have[0]).get("backend") in ("hip", "metal", "cpu", "vulkan") else "cuda"
     else:
         # nothing set up yet (START-MNTQ.bat / ./mntq.sh without --backend): the engine this tree already carries
         # (the portable downloads ship one), else Metal on a Mac with Apple Silicon, HIP on a PC with a supported AMD
@@ -8345,6 +8541,9 @@ def main() -> int:
         elif a.backend == "cpu":
             say(f"This PC can run Mantiq on its CPU alone (mntq-cpu: ggml's CPU backend, text only). "
                 f"Run {ME} --backend cpu without --check to set it up.")
+        elif a.backend == "vulkan":
+            say(f"This PC can run Mantiq on its GPU through Vulkan (mntq-vulkan: ggml's Vulkan backend, text only). "
+                f"Run {ME} --backend vulkan without --check to set it up.")
         elif a.backend == "hip":
             pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")

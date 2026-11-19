@@ -58,9 +58,9 @@ goto :eof
 :freeport
 rem %1 = the port.  End every process of a previous run (the dashboard's server.py, the mntq.py that started it, the
 rem telemetry children, the engine).  netstat reports PID 0 for an inherited listening socket, so the processes are
-rem matched by their path / command line under this folder, not by the port's owner - and only python*.exe / mntq.exe,
-rem so this window and PowerShell itself are never matched.
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'mntq.exe' -or $_.Name -like 'python*.exe') -and ($_.ExecutablePath -like '%~dp0*' -or $_.CommandLine -like '*%~dp0*') } | ForEach-Object { Write-Host ('  stopping ' + $_.Name + ' PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+rem matched by their path / command line under this folder, not by the port's owner - and only python*.exe / mntq*.exe
+rem (the engine is mntq.exe, mntq-cpu.exe, mntq-vulkan.exe, ...), so this window and PowerShell itself are never matched.
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -like 'mntq*.exe' -or $_.Name -like 'python*.exe') -and ($_.ExecutablePath -like '%~dp0*' -or $_.CommandLine -like '*%~dp0*') } | ForEach-Object { Write-Host ('  stopping ' + $_.Name + ' PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 rem wait for Windows to release the port (a killed process's socket can linger a moment)
 set "tries=0"
 :fp_wait

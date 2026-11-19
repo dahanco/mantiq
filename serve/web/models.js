@@ -427,6 +427,7 @@ const QWEN_KV = [{id: "fp16", label: "FP16", bytes: 26112}, {id: "int8", label: 
                  {id: "k8v4", label: "K8 V4", bytes: 11328}, {id: "q4_0", label: "Q4_0", bytes: 8448}];
 function qwenFields(m, d, s, ch, gpus) {
   const mtp = m.choices.draft.includes("mtp");
+  const ggml = ["metal", "cpu", "vulkan"].includes(m.backend);   // (the ggml builds draft with the GGUF's own NextN block)
   const kv = QWEN_KV.find((f) => f.id === d.kv) || QWEN_KV[0];
   const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 8000, unit: "experts", subLabel: "Experts in the GPU's pool"});
   const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 4096, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -437,10 +438,12 @@ function qwenFields(m, d, s, ch, gpus) {
         hint=${m.choices.images ? "Reads images in chats: the image encoder starts when a picture arrives, no VRAM kept for it. Off reads text only."
           : "This model was set up without its image encoder: the setup adds it."}>
         <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
-      html`<${Row} label="Drafting" flag="--mtp-max-t" changed=${ch("draft", "mtp_drafts")}
-        hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC."
-          : "This pack has no MTP drafter: the setup builds it from the model file."}
-        below=${d.draft === "mtp" ? html`<div class="mdl-sub"><span>Drafts a round</span>
+      html`<${Row} label="Drafting" flag=${ggml ? "MNTQ_GLM_MTP_DECODE" : "--mtp-max-t"} changed=${ch("draft", "mtp_drafts")}
+        hint=${mtp ? (ggml ? "The model file's own MTP (NextN) block drafts a few tokens for the model to check: the same answer. Off keeps the block out of the engine, its memory left to the expert pool."
+          : "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC.")
+          : (ggml ? "This model file carries no MTP (NextN) block: there is nothing to draft with."
+          : "This pack has no MTP drafter: the setup builds it from the model file.")}
+        below=${d.draft === "mtp" ? html`<div class="mdl-sub"><span>Drafts a round${ggml ? " (MNTQ_GLM_MTP_DRAFT)" : ""}</span>
           <${Stepper} label="Drafts a round" value=${d.mtp_drafts} min=${1} max=${8}
             on=${(v) => setDraft({mtp_drafts: v})}/><//>` : null}>
         <${Switch} label="Drafting" on=${d.draft === "mtp"} disabled=${!mtp}

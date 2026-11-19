@@ -75,7 +75,7 @@ def setup_command(model_id: str, cfg: dict | None) -> list:
            "--no-start"]
     if inst.get("models_dir"):
         cmd += ["--models-dir", str(inst["models_dir"])]
-    if (cfg or {}).get("backend") in ("hip", "metal", "cpu"):
+    if (cfg or {}).get("backend") in ("hip", "metal", "cpu", "vulkan"):
         cmd += ["--backend", cfg["backend"]]
     return cmd
 

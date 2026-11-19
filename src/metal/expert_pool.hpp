@@ -10,10 +10,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_backend;
 struct ggml_backend_buffer;
 struct ggml_backend_device;
 
@@ -22,8 +24,11 @@ namespace mntq::metal {
 struct ReadJob {
     int fd = -1;
     uint64_t offset = 0;
-    void* dst = nullptr;
+    void* dst = nullptr;           // where the bytes land (a host pool: inside a tensor)
     size_t bytes = 0;
+    ggml_tensor* t = nullptr;      // a device pool: the tensor the bytes are copied into
+    size_t t_off = 0;              // ... at this byte offset
+    const void* src = nullptr;     // set: the bytes are copied from here instead of read from the file
 };
 
 // A fixed set of threads doing pread; read() splits the jobs into <= 1 MiB pieces and blocks until all are done.
@@ -58,8 +63,11 @@ public:
     // layers: per layer, gate/up/down (empty entries for dense layers).  budget: bytes for the slots in use now;
     // cap: bytes the pool may grow to (its address space is mapped up front, a slot takes memory once written).
     // forced_slots > 0 overrides both (per group).  dev == nullptr: plain host memory (the CPU backend).
+    // ram_bytes > 0 and a streaming device pool: a host cache of the experts the pool evicts, so a miss is served
+    // from memory instead of the SSD (ram_lookup / ram_reserve).  Sized from the model's expert bytes, 0: none.
     bool init(const std::vector<std::vector<ExpertMatrix>>& layers, int n_expert, int min_slots, size_t budget,
-              size_t cap, int forced_slots, ggml_backend_device* dev, int io_threads, std::string& err);
+              size_t cap, int forced_slots, size_t ram_bytes, ggml_backend_device* dev, int io_threads,
+              std::string& err);
 
     // take up to `bytes` more of the mapped slots into use (each group by its share); returns the bytes taken
     size_t grow(size_t bytes);
@@ -88,7 +96,9 @@ public:
     int slot_base(int layer) const { return layers_[(size_t) layer].base; }
     size_t slots_total() const;
     size_t bytes() const { return bytes_; }
+    size_t ram_bytes() const { return ram_bytes_; }   // the host cache's bytes (0: none)
     uint64_t hits = 0, misses = 0, bytes_read = 0;
+    uint64_t ram_hits = 0, ram_misses = 0;            // pool misses the host cache served / had to read
     double io_seconds = 0.0;
 
 private:
@@ -102,6 +112,18 @@ private:
         std::vector<int> owner;          // slot -> layer * n_expert + expert, -1 free
         std::vector<uint64_t> last_use;  // slot -> tick
         std::vector<uint32_t> stamp;     // slot -> ensure() call that pinned it
+        // the host cache of the experts the slots above evict (a streaming device pool, ram_bytes > 0): one entry
+        // holds one expert's three matrices, at ram_off[w] inside it.  It comes from the device's host buffer type
+        // where there is one, so the device reads an entry directly (see ExpertPool::stream).
+        ggml_backend_buffer* ram_buf = nullptr;
+        char* ram = nullptr;
+        size_t ram_block = 0;            // bytes one cached expert takes
+        size_t ram_off[3] = {0, 0, 0};   // where gate/up/down start inside an entry
+        int ram_n = 0;                   // entries
+        int ram_used = 0;                // entries filled
+        std::unordered_map<int64_t, int> ram_at;   // layer * n_expert + expert -> entry, -1: not cached
+        std::vector<int64_t> ram_key;              // entry -> key, -1: free
+        std::vector<uint64_t> ram_use;             // entry -> tick
     };
     struct Layer {
         int group = -1;
@@ -110,11 +132,26 @@ private:
         int base = 0;                    // all resident: the layer's first slot
     };
     void pin_slots(Group& g, int from, int to);
+    ReadJob job(Group& g, const ExpertMatrix& m, int e, int w, int s) const;
+    bool stream(std::vector<ReadJob>& jobs, std::string& err);   // read the jobs (through staging on a device)
+    int ram_lookup(int layer, int expert);    // the host cache entry holding this expert (recency refreshed), -1: none
+    int ram_reserve(int layer, int expert);   // an entry for it: a free one, else the least recently used
     std::vector<Group> groups_;
     std::vector<Layer> layers_;
     ggml_context* ctx_ = nullptr;
     std::vector<ggml_backend_buffer*> bufs_;
     std::vector<std::pair<void*, size_t>> mem_;
+    ggml_backend_device* dev_ = nullptr;
+    // the device can wrap host memory with the tensor's own address (Metal); a device that cannot (Vulkan) gets real
+    // buffers and the bytes are copied in through stage_.  A stage pinned and registered with the device turns the
+    // writes into queued buffer copies flushed once a batch; plain memory costs a fence wait a slice.
+    bool host_ptr_ = true;
+    void* stage_ = nullptr;
+    size_t stage_size_ = 0;
+    ggml_backend_buffer* stage_buf_ = nullptr;
+    bool ram_on_ = false;                // the groups carry a host cache: a miss is served from memory
+    size_t ram_bytes_ = 0;               // all of them together
+    ggml_backend* dev_backend_ = nullptr;
     ParallelReader* reader_ = nullptr;
     int n_expert_ = 0;
     int n_pairs_ = 0;                    // (layer, expert) pairs with routed experts

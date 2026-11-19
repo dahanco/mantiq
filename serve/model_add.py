@@ -80,10 +80,11 @@ def pick_gguf(timeout: float = 900.0) -> str | None:
 
 
 def backend() -> str:
-    """The engine backend this install runs: MANTIQ_BACKEND, which mntq.py puts in its server's environment (the CPU
-    engine and Metal have their own, not build/mntq), else CUDA - the setup's own default when nothing is set up yet."""
+    """The engine backend this install runs: MANTIQ_BACKEND, which mntq.py puts in its server's environment (the CPU,
+    Metal and Vulkan engines have their own, not build/mntq), else CUDA - the setup's own default when nothing is set
+    up yet."""
     b = (os.environ.get("MANTIQ_BACKEND") or "").strip().lower()
-    return b if b in ("cuda", "hip", "metal", "cpu") else "cuda"
+    return b if b in ("cuda", "hip", "metal", "cpu", "vulkan") else "cuda"
 
 
 def add_command(path: Path) -> list:
@@ -96,15 +97,17 @@ def add_command(path: Path) -> list:
 
 def setup_needed() -> bool:
     """Whether this PC has not been set up yet: llama.cpp's source (the pack builder's gguf-py, tools/_paths.py) and
-    the engine mntq.py compiles (build/mntq, build-hip/mntq, build-metal/mntq-metal, build-cpu/mntq-cpu).  A fresh
-    download has neither, and this page's "Add Local Model" is how its first model gets in: mntq.py's add_model_setup
-    runs the setup's own steps 1, 3 and 4 inside that add, so the page shows them in a window of their own - the card
-    below is about the model's pack."""
+    the engine mntq.py compiles (build/mntq, build-hip/mntq, build-metal/mntq-metal, build-cpu/mntq-cpu,
+    build-vulkan/mntq-vulkan).  A fresh download has neither, and this page's "Add Local Model" is how its first model
+    gets in: mntq.py's add_model_setup runs the setup's own steps 1, 3 and 4 inside that add, so the page shows them in
+    a window of their own - the card below is about the model's pack."""
     if not (ROOT / "third_party" / "llama.cpp" / "gguf-py" / "gguf").is_dir():
         return True
     b = backend()
     if b == "cpu":
         return not any((ROOT / "build-cpu" / n).exists() for n in ("mntq-cpu.exe", "mntq-cpu"))
+    if b == "vulkan":
+        return not any((ROOT / "build-vulkan" / n).exists() for n in ("mntq-vulkan.exe", "mntq-vulkan"))
     if b == "metal":
         return not (ROOT / "build-metal" / ("mntq-metal.exe" if os.name == "nt" else "mntq-metal")).exists()
     names = ("mntq.exe", "mntq") if os.name == "nt" else ("mntq",)

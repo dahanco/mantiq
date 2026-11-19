@@ -139,7 +139,7 @@ missing; it installs nothing system-wide.
 
 ### Prebuilt packages (Windows, nothing to build)
 
-Two ready-to-run packages are published with every [release](https://github.com/dahanco/mantiq/releases/latest). Unzip
+Three ready-to-run packages are published with every [release](https://github.com/dahanco/mantiq/releases/latest). Unzip
 one, double-click `START-MNTQ.bat`, and the first start asks for the model and downloads it - no compiler, no CUDA
 toolkit, no Python to install, and nothing is put on `PATH`:
 
@@ -147,8 +147,9 @@ toolkit, no Python to install, and nothing is put on `PATH`:
 | --- | --- | --- |
 | `Mantiq-Portable-CUDA.zip` (about 590 MB) | an NVIDIA PC | the compiled engine (`build\mntq.exe`) with its CUDA libraries, Mantiq's Python and its packages, and the stamped sources the engine was built from |
 | `Mantiq-Portable-CPU.zip` (about 45 MB) | any 64-bit PC, no GPU needed | the same dashboard on `ggml`'s CPU engine (`build-cpu\mntq-cpu.exe`) and the same Python |
+| `Mantiq-Portable-Vulkan.zip` (about 60 MB) | a PC whose GPU has no CUDA and no HIP (the GPU's own driver is enough) | the same dashboard on `ggml`'s Vulkan engine (`build-vulkan\mntq-vulkan.exe`) and the same Python |
 
-Neither one carries a model: nothing is downloaded until the start asks, and a GGUF you already have can be added
+None of them carries a model: nothing is downloaded until the start asks, and a GGUF you already have can be added
 instead (below).
 
 ## Models that run on it

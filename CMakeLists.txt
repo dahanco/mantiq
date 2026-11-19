@@ -96,6 +96,13 @@ if(MNTQ_ENABLE_CPU)   # (the CUDA / AMD options do not apply to this build)
   return()
 endif()
 
+# Vulkan: mntq-vulkan (the same engine through ggml's Vulkan backend: a GPU with no CUDA, cmake/vulkan_backend.cmake)
+option(MNTQ_ENABLE_VULKAN "Build mntq-vulkan (the engine on ggml-vulkan: a GPU with no CUDA)" OFF)
+if(MNTQ_ENABLE_VULKAN)   # (the CUDA / AMD options do not apply to this build)
+  include(cmake/vulkan_backend.cmake)
+  return()
+endif()
+
 if(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to

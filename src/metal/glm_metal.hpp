@@ -104,6 +104,7 @@ struct GlmOptions {
     bool kv_f32 = false;              // keep the latent F32 on the GPU with dsa_mm too: the fused kernel reads F32 rows
                                       // (--kv-f32 / MNTQ_METAL_KV_F32=1; twice the cache bytes, for A/B runs)
     size_t expert_budget = 0;         // bytes for the routed-expert pool; 0: derive from the GPU's working set
+    size_t expert_ram_bytes = 0;      // host cache of the experts the pool evicts (--expert-ram-gb); 0: off
     int pool_slots = 0;               // >0: force this many slots per expert group (tests)
     int io_threads = 16;
     std::string expert_profile;       // a ranked expert profile (data/expert-profile-glm.bin): warms the pool at load
@@ -120,6 +121,8 @@ struct GlmStats {
     uint64_t tokens = 0;
     uint64_t expert_hits = 0;
     uint64_t expert_misses = 0;
+    uint64_t ram_hits = 0;            // pool misses the host cache of experts served from memory (no SSD read)
+    size_t ram_bytes = 0;             // bytes of that cache
     uint64_t bytes_read = 0;
     double io_seconds = 0.0;          // wall time the forward waited on expert reads
     double gpu_seconds = 0.0;         // wall time in graph compute
