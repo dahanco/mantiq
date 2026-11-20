@@ -510,6 +510,31 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
     o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
 }
+// The same two splits parametric in the head geometry, for the architectures that do not run at 24 x 256
+// (qwen35moe's full-attention layers carry 16 heads at head_dim 256).
+__global__ void split_q_heads_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t n, int64_t n_head,
+                                     int64_t hd) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t per = n_head * hd;
+    const int64_t t = i / per, h = (i / hd) % n_head, d = i % hd;
+    q[i] = qf[t * 2 * per + h * 2 * hd + d];
+}
+__global__ void gate_attn_heads_kernel(const float* __restrict__ a, const float* __restrict__ qf,
+                                       uint16_t* __restrict__ o16, int64_t n, int64_t n_head, int64_t hd) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t per = n_head * hd;
+    const int64_t t = i / per, h = (i / hd) % n_head, d = i % hd;
+    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 2 * per + h * 2 * hd + hd + d]))));
+}
+// The identity selection of the indexer-free full-attention layers, as a [n_q, cap] block: row `q` holds
+// 0, 1, ... cap-1, which is exactly `topk` over equal scores returns.
+__global__ void iota_rows_kernel(int32_t* __restrict__ ids, int64_t n_q, int64_t cap) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_q * cap) return;
+    ids[i] = (int32_t) (i % cap);
+}
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
 // resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
@@ -731,6 +756,22 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
     check("gate_attn");
+}
+void split_q_heads(const float* q_full, float* q, int64_t n, int64_t n_head, int64_t hd, void* stream) {
+    if (n <= 0) return;
+    split_q_heads_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(q_full, q, n, n_head, hd);
+    check("split_q_heads");
+}
+void gate_attn_heads(const float* attn, const float* q_full, uint16_t* out16, int64_t n, int64_t n_head, int64_t hd,
+                     void* stream) {
+    if (n <= 0) return;
+    gate_attn_heads_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, n, n_head, hd);
+    check("gate_attn_heads");
+}
+void iota_rows(int32_t* ids, int64_t n_q, int64_t cap, void* stream) {
+    if (n_q <= 0 || cap <= 0) return;
+    iota_rows_kernel<<<blocks_for(n_q * cap), 256, 0, (cudaStream_t) stream>>>(ids, n_q, cap);
+    check("iota_rows");
 }
 
 }  // namespace strata::prefill

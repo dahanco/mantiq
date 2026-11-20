@@ -16,6 +16,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -49,10 +51,15 @@ constexpr int64_t kMaxPrefillChunk = 2048;
 // routed experts than this takes several grouped launches.  Bounded deliberately: the alternative is one
 // blob per distinct expert, which for a wide chunk is most of `n_expert` and does not fit beside the cache.
 constexpr int64_t kExpertRingSlots = 24;
-// The columns `shared_expert_multi` takes in one call.  It serves a wider batch by running itself once per 8
-// columns, so the q8_1 activation image it reads has to hold 8 columns and no more - the buffers below are sized
-// for this, not for the chunk.
-constexpr int kSharedCols = 8;
+// The widest tile `shared_expert_multi` takes in one call.  It serves a wider window by running itself once per
+// 32 columns, so the q8_1 activation image it reads has to hold 32 columns and no more - the buffers below are
+// sized for this, not for the chunk.
+constexpr int kSharedCols = 32;
+// The queries the batched full-attention half hands `qsa_decode_attn_batch` at once.  Its per-query partials
+// follow the tile's OWN capacity (`chunks * n_head * (head_dim + 2)`), and the indexer-free selection's ceiling
+// is 32K cells, so this bounds that scratch at `kQsaAttnBatch` times ~8.5 MB in the worst case - which is why
+// the attention is tiled rather than run over the whole chunk.
+constexpr int64_t kQsaAttnBatch = 8;
 // The phase counters `MNTQ_PREFILL_PROF` fills.  Slots 0-5 are the layer's own halves, 6-9 break the MoE half
 // down because it is the one that dominates a chunk: the router and shared expert, the host-side plan, the
 // per-expert staging plus the grouped launches, and the combine.
@@ -90,6 +97,69 @@ void add_rows(float* R, const float* bo, int64_t n, cudaStream_t cs) {
 
 __global__ void set_count_kernel(int32_t* dst, int32_t count) {
     *dst = count;
+}
+
+// ------------------------------------------------------------------ the expert-result staging buffer
+// `h_parts` is filled by the CPU expert pool and then handed to the device once per layer - `T*K*N` floats, 134
+// MB at the widest chunk.  Through a pageable `std::vector`, `cudaMemcpyAsync` has to bounce the data through
+// an internal page-locked staging buffer, and on this link (PCIe 3.0 x16) that cost the upload about a fifth of
+// its bandwidth: the copy engine only reaches full rate when it can read the source pages directly.  So the
+// buffer is page-locked instead (`cudaHostAlloc`), which is what makes the upload a single DMA.
+//
+// It is a CAPACITY, not a size: the pool's jobs are handed raw row pointers into it, the CPU fills exactly the
+// entries it owns and the resident plan fills the rest on the device, so the bytes between the two writers are
+// never read and the buffer must never be zeroed or reallocated between the jobs being built and the upload.
+struct PinnedFloats {
+    float* p = nullptr;
+    size_t cap = 0;
+    bool pinned = false;
+    std::vector<float> fallback;   ///< only when the host refuses to pin: the DMA then stages through the driver
+    float* data() const { return p; }
+    /// Grows to hold `n` floats.  Returns false only when BOTH the pinned and the pageable host allocation are
+    /// refused, which the caller reports rather than running on a buffer that is too small.  A refused
+    /// `cudaHostAlloc` is not fatal: the pinning is a bandwidth optimization, so the buffer falls back to
+    /// pageable memory (the upload then copies through the driver's own staging, ~10.9 rather than 13.0 GB/s)
+    /// and says so - the machine that refuses it has 30 GiB pinned for the expert arena already.
+    bool reserve(size_t n) {
+        if (n <= cap) return true;
+        if (pinned && p != nullptr) cudaFreeHost(p);
+        p = nullptr;
+        cap = 0;
+        pinned = false;
+        void* q = nullptr;
+        if (cudaHostAlloc(&q, n * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+            p = static_cast<float*>(q);
+            cap = n;
+            pinned = true;
+            return true;
+        }
+        std::fprintf(stderr, "mntq generate: qwen35moe prompt path: could not pin the %zu MiB expert staging "
+                             "buffer (%s); falling back to pageable memory\n",
+                     n * sizeof(float) >> 20, cudaGetErrorString(cudaGetLastError()));
+        fallback.resize(n);
+        p = fallback.data();
+        cap = n;
+        return true;
+    }
+    ~PinnedFloats() {
+        if (pinned && p != nullptr) cudaFreeHost(p);
+    }
+    PinnedFloats() = default;
+    PinnedFloats(const PinnedFloats&) = delete;
+    PinnedFloats& operator=(const PinnedFloats&) = delete;
+};
+
+// ------------------------------------------------------------------ the CPU experts' merge
+// The CPU results arrive as a COMPACT image -row `c` is the `c`-th entry a CPU expert computed, not the `c`-th
+// row of `parts`- because that is what makes their upload and the resident experts independent: the DMA writes
+// no row the grouped launch touches, so the two can run at once.  This puts every row back where the combine
+// reads it.  `blockIdx.y` is the entry, so the grid is capped at 65535 entries; a chunk's `T*top_k` is at most
+// 2048 * 15.
+__global__ void scatter_rows_kernel(float* __restrict__ dst, const int32_t* __restrict__ rows,
+                                    const float* __restrict__ src, int width) {
+    const int64_t r = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < width) dst[(size_t) rows[r] * width + c] = src[(size_t) r * width + c];
 }
 
 // ------------------------------------------------------------------ the chunk arena
@@ -141,6 +211,8 @@ struct Buffers {
     int32_t* ids = nullptr;          ///< (T, top_k) the routed experts, in the ROUTER's order
     float* weights = nullptr;        ///< (T, top_k) the router's weights, already renormalized
     float* parts = nullptr;          ///< (T*top_k, n_embd) the routed experts, row = token*top_k + slot
+    float* cpu_parts = nullptr;      ///< (T*top_k, n_embd) the CPU experts' results, row = the CPU entry's index
+    int32_t* cpu_dst = nullptr;      ///< (T*top_k) a CPU entry -> the row of `parts` the merge copies it to
     float* shared = nullptr;         ///< (T, n_embd) the shared expert, ALREADY gated by its sigmoid
     float* sh_gate = nullptr;        ///< (T, n_ff) the shared expert's gate projection
     float* sh_up = nullptr;          ///< (T, n_ff) ... its up projection
@@ -157,9 +229,26 @@ struct Buffers {
     int32_t* g_tok = nullptr;        ///< (T*top_k) entry -> the token whose activation it reads
     uint16_t* gemm_scratch = nullptr;
     void* gemm_ws = nullptr;
+    // ---- the full-attention half
+    float* qsa_qf = nullptr;            ///< (T, n_head, 2 * head_dim) the raw `attn_q` projection, q | gate
+    float* qsa_q = nullptr;             ///< (T, n_head, head_dim) its FIRST half, normed and rotated
+    float* qsa_kc = nullptr;            ///< (T, n_head_kv, head_dim) the normed and rotated keys
+    float* qsa_vc = nullptr;            ///< (T, n_head_kv, head_dim) the values, as projected
+    float* qsa_attn = nullptr;          ///< (T, n_head, head_dim) the attention output
+    uint16_t* qsa_attn_h = nullptr;     ///< ... its FP16 image (the o-projection's activation)
+    int32_t* qsa_ids = nullptr;         ///< (kQsaAttnBatch, cap) the identity selection of one query tile
+    int32_t* qsa_steps = nullptr;       ///< (T, kStepCount) the per-position step records
+    float* qsa_attn_scratch = nullptr;  ///< kQsaAttnBatch times the decode kernel's per-query partials
 };
 
-void carve_chunk(int64_t T, const core::ModelGeometry& g, int64_t k, Alloc& o, Buffers& b) {
+/// The largest selection the session's context can produce: the indexer-free full-attention layers select every
+/// cached cell, so a query's width is `min(pos + 1, kTopkMaxCells)` and the whole path is sized from the biggest
+/// one.  Never zero, so the carve can size the selection and attention scratch from it.
+int64_t qsa_cap_for(const core::SessionState& ss) {
+    return std::max<int64_t>(1, std::min<int64_t>(ss.max_cells, strata::kernels::kTopkMaxCells));
+}
+
+void carve_chunk(int64_t T, const core::ModelGeometry& g, int64_t k, int64_t qsa_cap, Alloc& o, Buffers& b) {
     const size_t N = (size_t) g.n_embd, C = (size_t) g.ssm_conv_channels, ZV = (size_t) g.ssm_value_dim;
     const size_t HV = (size_t) g.ssm_v_heads;
     const size_t NE = (size_t) g.n_expert, FF = (size_t) g.n_ff, K = (size_t) k;
@@ -187,6 +276,11 @@ void carve_chunk(int64_t T, const core::ModelGeometry& g, int64_t k, Alloc& o, B
     b.ids = o.take<int32_t>(ENT);
     b.weights = o.take<float>(ENT);
     b.parts = o.take<float>(ENT * N);
+    // The CPU experts' own image, in CPU-entry order rather than in `parts`'s row order: keeping it compact is
+    // what lets its upload and the resident experts' launch run at once (see `routed_hybrid`), and its device
+    // pair is the index list the merge puts each row back with.
+    b.cpu_parts = o.take<float>(ENT * N);
+    b.cpu_dst = o.take<int32_t>(ENT);
     b.shared = o.take<float>((size_t) T * N);
     b.sh_gate = o.take<float>((size_t) T * FF);
     b.sh_up = o.take<float>((size_t) T * FF);
@@ -204,6 +298,21 @@ void carve_chunk(int64_t T, const core::ModelGeometry& g, int64_t k, Alloc& o, B
     b.g_tok = o.take<int32_t>(ENT);
     b.gemm_scratch = o.take<uint16_t>((size_t) GEMM_SCRATCH_ELEMS);
     b.gemm_ws = o.take_bytes(GEMM_WS_BYTES);
+    // ---- the full-attention half.  `qsa_cap` is the largest selection the session's context can produce
+    // (`min(max_cells, kTopkMaxCells)`): the identity selection returns every cached cell, so a query's width
+    // and the tile capacity `iota_rows`/`qsa_decode_attn_batch` are sized from it follow the position.
+    const size_t NH = (size_t) g.n_head, NKV = (size_t) g.n_head_kv, HD = (size_t) g.head_dim;
+    b.qsa_qf = o.take<float>((size_t) T * NH * 2 * HD);
+    b.qsa_q = o.take<float>((size_t) T * NH * HD);
+    b.qsa_kc = o.take<float>((size_t) T * NKV * HD);
+    b.qsa_vc = o.take<float>((size_t) T * NKV * HD);
+    b.qsa_attn = o.take<float>((size_t) T * NH * HD);
+    b.qsa_attn_h = o.take<uint16_t>((size_t) T * NH * HD);
+    b.qsa_ids = o.take<int32_t>((size_t) kQsaAttnBatch * (size_t) qsa_cap);
+    b.qsa_steps = o.take<int32_t>((size_t) T * (size_t) strata::kernels::kStepCount);
+    b.qsa_attn_scratch = o.take<float>(
+        (size_t) kQsaAttnBatch * (size_t) strata::kernels::qsa_decode_attn_scratch_floats(qsa_cap,
+                                                                                           core::qsa_shapes(g)));
 }
 
 /// The GDN state is ONE contiguous block per GDN layer: the recurrence (states x v_heads x states floats) then
@@ -250,6 +359,8 @@ struct Qwen35MoePrefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t chunk = 0;
     cudaStream_t cs = nullptr;
+    cudaStream_t cs2 = nullptr;   ///< the CPU results' upload: its own stream so the DMA runs beside the experts
+    cudaEvent_t ev_up = nullptr;  ///< marks that upload's completion on `cs2`
     Gemm gemm;
     uint8_t* arena = nullptr;
     size_t arena_bytes = 0;
@@ -263,14 +374,30 @@ struct Qwen35MoePrefill::Impl {
     std::vector<int32_t> h_count;    ///< (n_expert) entries per expert, then the fill cursors
     std::vector<int32_t> h_ord;      ///< the distinct experts, ascending
     std::vector<int32_t> h_dst, h_tok, h_count_batch;
+    std::vector<int32_t> cpu_dst;  ///< (T*top_k) the CPU entries' rows of `parts`, in the order they were built
     std::vector<unsigned long long> h_ptr;  ///< one device blob address per batch slot
     std::vector<uint8_t> h_stage;    ///< the copy `copy_blob` writes for a source whose blob does not stay put
     strata::kernels::cpu::ExpertPool* pool = nullptr;  // borrowed from the driver, never a second worker pool
-    std::vector<float> h_mixed, h_parts;
+    std::vector<float> h_mixed;
+    PinnedFloats h_cpu;     ///< the CPU experts' results, compact, page-locked (see PinnedFloats)
+    std::vector<int32_t> h_steps;  ///< (T * kStepCount) the batched full-attention half's per-position records
     std::vector<uint8_t> h_act;
     std::vector<strata::kernels::cpu::ActQ> h_act_q2;
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     std::vector<std::vector<uint8_t>> cpu_blobs;
+
+    // `MNTQ_PREFILL_PROF` only: `routed_hybrid`'s six stages, so `moe_stage`'s single number can be told apart from
+    // the CPU pool's.  rb_ms[i] is the wall time between mark i and mark i+1, rb_n its call count.
+    double rb_ms[6] = {};
+    int64_t rb_n = 0;
+    long long rb_cpu_jobs = 0, rb_res_experts = 0, rb_cpu_tokens = 0;
+    // The same for `moe_route` (slot 6): the router's projection, the shared expert, the ids read-back that the
+    // group plan needs on the host, and the q8_1 activation image.  They sum to slot 6.
+    double rr_ms[4] = {};
+    int64_t rr_n = 0;
+    // The shared expert's HOST-side time alone (the call returning, with every kernel queued but not drained),
+    // so `rr_ms[1]` can be split into the launch/recursion cost and the GPU tail that follows it.
+    double rr_host_ms = 0;
 
     // PHASE 5 TUNING ONLY, and off unless `MNTQ_PREFILL_PROF` is set: the wall time of each phase of the layer,
     // measured with a stream sync on either side so the host clock attributes every microsecond of GPU work to
@@ -302,6 +429,8 @@ struct Qwen35MoePrefill::Impl {
 
     ~Impl() {
         if (arena != nullptr) cudaFree(arena);
+        if (cs2 != nullptr) cudaStreamDestroy(cs2);
+        if (ev_up != nullptr) cudaEventDestroy(ev_up);
     }
 
     /// One half's read under the plain-residual architecture: `mixed = rms_norm(R, w)` - the lone RMSNorm
@@ -377,18 +506,11 @@ struct Qwen35MoePrefill::Impl {
         return true;
     }
 
-    /// The full-attention half of layer `l`.  qwen35moe's ten full-attention layers carry plain GQA and NO DSA
-    /// indexer, and the decode path already runs exactly that arithmetic for one token (`core::qsa_layer`,
-    /// layer.cpp:910): the identity selection over the KV pool, the Q/K norms, the rotation, the append, the
-    /// attention and the sigmoid gate.  The chunk has to append its cells to the SAME pool and attend causally,
-    /// so its queries are served by that same function, one position at a time.
-    ///
-    /// That is not a shortcut around the arithmetic - it IS the reference arithmetic, so this half cannot drift
-    /// from the token path's.  The saving this module exists for is in the MoE half (each DISTINCT expert of a
-    /// chunk read once instead of once per token), and that half stays batched.
+    /// The full-attention half of layer `l`, in the decode path's own arithmetic (the identity selection over
+    /// the KV pool, the Q/K norms, the rotation, the append, the attention and the sigmoid gate) - see the two
+    /// implementations below.  The batched one is the default; the per-position one is the reference and the
+    /// fallback for the KV formats the batched one does not cover.
     bool qsa_mixer(int64_t l, int64_t T, int64_t pos0, std::string& err) {
-        const core::ModelGeometry& gm = *g;
-        const int64_t N = gm.n_embd;
         const int64_t qi = qsa_idx[(size_t) l];
         if (qi < 0 || ss->qsa_states == nullptr) {
             err = "qwen35moe prefill: layer " + std::to_string(l) +
@@ -396,6 +518,20 @@ struct Qwen35MoePrefill::Impl {
             return false;
         }
         const core::QsaState& st = ss->qsa_states[qi];
+        // The batched path reads the resident FP16 pool directly and drives no block movers.  Every other KV
+        // format (streamed, INT8, Q4_0, K8V4) needs the ones `qsa_layer` drives, so it takes the per-position
+        // path; `MNTQ_QSA_SERIAL=1` forces that path for the A/B.
+        static const bool serial = std::getenv("MNTQ_QSA_SERIAL") != nullptr;
+        if (serial || st.kv_mode != 0 || st.kv_int8 || st.kv_q4 || st.kv_hybrid)
+            return qsa_serial(l, T, pos0, st, err);
+        return qsa_batched(l, T, pos0, st, err);
+    }
+
+    /// The per-position full-attention half: the decode path's own `core::qsa_layer`, one token at a time.
+    /// This is the reference arithmetic, so it cannot drift from the token path's.
+    bool qsa_serial(int64_t l, int64_t T, int64_t pos0, const core::QsaState& st, std::string& err) {
+        const core::ModelGeometry& gm = *g;
+        const int64_t N = gm.n_embd;
         for (int64_t t = 0; t < T; ++t) {
             if (!core::qsa_layer(*wt, gm, l, pos0 + t, /*pos_base=*/0, st, ss->qsa_bufs,
                                  bufs.mixed + (size_t) t * (size_t) N, bufs.bo + (size_t) t * (size_t) N, cs, err)) {
@@ -407,6 +543,100 @@ struct Qwen35MoePrefill::Impl {
         return true;
     }
 
+    /// The BATCHED full-attention half: the projections are GEMMs over the whole chunk, K/V and the selection
+    /// go in one round of launches each, and the attention is `qsa_decode_attn_batch` in tiles.  This is the
+    /// shape `prefill.cpp`'s glm half takes, with two differences that follow from the architecture: there is
+    /// no DSA indexer, so the selection is the IDENTITY (`iota_rows`), and its 16-head/2-KV-head geometry is
+    /// served by the 8:1 GQA instantiation of the decode attention.
+    ///
+    /// The numbers this trades for its speed are the batched path's own, and `prefill.cpp` accepts the same
+    /// ones: the projections take FP16 activations where the token path takes Q8_K/Q8_0, so the result is
+    /// FP32-level rather than bit-identical to `qsa_serial`.
+    bool qsa_batched(int64_t l, int64_t T, int64_t pos0, const core::QsaState& st, std::string& err) {
+        const core::ModelGeometry& gm = *g;
+        const int64_t NH = gm.n_head, NKV = gm.n_head_kv, HD = gm.head_dim;
+        const int64_t gqa = NKV > 0 ? NH / NKV : 0;
+        // `qsa_decode_attn_batch` answers an unsupported geometry, a null pool or a missing buffer with
+        // `std::exit(1)`, which no caller can recover from - so every one of its demands is checked HERE first.
+        if (HD != 256 || NKV <= 0 || NH != gqa * NKV || (gqa != 8 && gqa != 12)) {
+            err = "qwen35moe prefill: layer " + std::to_string(l) + "'s attention geometry (" +
+                  std::to_string(NH) + " heads / " + std::to_string(NKV) + " kv heads / head_dim " +
+                  std::to_string(HD) + ") has no batched decode-attention kernel";
+            return false;
+        }
+        if (st.page_table == nullptr || st.k_pool == nullptr || st.v_pool == nullptr) {
+            err = "qwen35moe prefill: layer " + std::to_string(l) + "'s FP16 KV pool is not resident";
+            return false;
+        }
+        const strata::kernels::QsaShapes s = core::qsa_shapes(gm);
+
+        const core::LayerView v(*wt, l);
+        const core::WeightRef* wq = v.get("attn_q.weight");
+        const core::WeightRef* wk = v.get("attn_k.weight");
+        const core::WeightRef* wv = v.get("attn_v.weight");
+        const core::WeightRef* wo = v.get("attn_output.weight");
+        const core::WeightRef* wqn = v.get("attn_q_norm.weight");
+        const core::WeightRef* wkn = v.get("attn_k_norm.weight");
+        const char* missing = !wq ? "attn_q.weight" : !wk ? "attn_k.weight" : !wv ? "attn_v.weight"
+                              : !wo ? "attn_output.weight" : !wqn ? "attn_q_norm.weight"
+                              : !wkn ? "attn_k_norm.weight" : nullptr;
+        if (missing != nullptr) {
+            err = "qwen35moe prefill: layer " + std::to_string(l) + ": " + v.name(missing) + " is missing";
+            return false;
+        }
+
+        // ---- the three projections, batched over the chunk
+        if (!proj(gemm, wk, bufs.mixed_f16, bufs.mixed_bf, bufs.qsa_kc, T, v.name("attn_k.weight"), err))
+            return false;
+        if (!proj(gemm, wv, bufs.mixed_f16, bufs.mixed_bf, bufs.qsa_vc, T, v.name("attn_v.weight"), err))
+            return false;
+        if (!proj(gemm, wq, bufs.mixed_f16, bufs.mixed_bf, bufs.qsa_qf, T, v.name("attn_q.weight"), err))
+            return false;
+
+        // ---- K: norm and rotate, then the whole chunk into the pool in one launch.  V goes in as projected -
+        // the same split `qsa_layer` makes (only K is rotated).
+        strata::prefill::rms_rows(bufs.qsa_kc, (const float*) wkn->data, T * NKV, HD, HD, EPS, cs);
+        strata::prefill::rope(bufs.qsa_kc, T, NKV, HD, NKV * HD, pos0, (float) strata::kernels::qsa_freq_base(), cs);
+        strata::prefill::kv_append(bufs.qsa_kc, bufs.qsa_vc, T, pos0, st.page_table, s.page_size, st.k_pool,
+                                   st.v_pool, nullptr, nullptr, nullptr, nullptr, cs, &st.host, nullptr);
+
+        // ---- the query: the FIRST half of each head, normed and rotated.  The second half is the gate and is
+        // read from `qsa_qf` by `gate_attn_heads` after the attention.
+        strata::prefill::split_q_heads(bufs.qsa_qf, bufs.qsa_q, T * NH * HD, NH, HD, cs);
+        strata::prefill::rms_rows(bufs.qsa_q, (const float*) wqn->data, T * NH, HD, HD, EPS, cs);
+        strata::prefill::rope(bufs.qsa_q, T, NH, HD, NH * HD, pos0, (float) strata::kernels::qsa_freq_base(), cs);
+
+        // ---- the per-position step records: `n_kv` and the width the selection returns
+        h_steps.resize((size_t) T * strata::kernels::kStepCount);
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::qsa_step_fill(h_steps.data() + t * strata::kernels::kStepCount, pos0 + t, s);
+        if (cudaMemcpyAsync(bufs.qsa_steps, h_steps.data(), (size_t) T * strata::kernels::kStepCount * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+            err = "qwen35moe prefill: the QSA step records did not upload";
+            return false;
+        }
+
+        // ---- the identity selection and the attention, in tiles.  A tile's capacity follows its OWN last
+        // position (`width = pos + 1` never exceeds it), so the partials `qsa_decode_attn_batch` writes are
+        // sized by that tile and not by the session's 32K-cell ceiling.
+        const strata::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
+        const int64_t cap_alloc = qsa_cap_for(*ss);
+        for (int64_t t0 = 0; t0 < T; t0 += kQsaAttnBatch) {
+            const int64_t nb = std::min<int64_t>(kQsaAttnBatch, T - t0);
+            const int64_t cap = std::min<int64_t>(pos0 + t0 + nb, cap_alloc);
+            strata::prefill::iota_rows(bufs.qsa_ids, nb, cap, cs);
+            strata::kernels::qsa_decode_attn_batch(bufs.qsa_q + t0 * NH * HD, pools, bufs.qsa_ids,
+                                                   bufs.qsa_steps + t0 * strata::kernels::kStepCount, cap, s,
+                                                   bufs.qsa_attn_scratch, bufs.qsa_attn + t0 * NH * HD, nb, cs);
+        }
+
+        // ---- the gate (each head's second half) and the output projection.  FP16 activations, as
+        // `prefill.cpp`'s QSA half uses: the batched path's arithmetic, not the token path's Q8_K image.
+        strata::prefill::gate_attn_heads(bufs.qsa_attn, bufs.qsa_qf, bufs.qsa_attn_h, T * NH * HD, NH, HD, cs);
+        if (!proj(gemm, wo, bufs.qsa_attn_h, nullptr, bufs.bo, T, v.name("attn_output.weight"), err)) return false;
+        return true;
+    }
+
     // Like ggml's mul_mat_id, keep the weights in their memory tier and group activation rows by expert.
     // Only activations/results cross PCIe for a CPU expert, not its multi-megabyte weight blob.
     bool routed_hybrid(int64_t l, int64_t T, const strata::kernels::cpu::NativeFmt& f,
@@ -414,25 +644,42 @@ struct Qwen35MoePrefill::Impl {
         using namespace strata::kernels::cpu;
         const size_t N = (size_t) g->n_embd, K = (size_t) ss->k, n_experts = (size_t) g->n_expert;
         const size_t ent = (size_t) T * K;
+        Clock::time_point tp[6];
+        int nmark = 0;
+        const auto mark = [&](bool sync) {
+            if (prof) { if (sync) cudaStreamSynchronize(cs); tp[nmark] = Clock::now(); }
+            ++nmark;
+        };
         h_mixed.resize((size_t) T * N);
         h_act.resize((size_t) T * kNativeActBytes);
-        h_parts.assign(ent * N, 0.0f);
+        // `reserve`, NOT a fill: every row is written before it is read - a CPU job fills the entries it owns
+        // and the resident experts fill theirs - so zeroing the buffer here was 134 MB of host stores per layer
+        // per chunk, 13.9 GB over one Qwopus3.6 35B A3B prompt (`2048 + 2048 + 1215` tokens), for values
+        // nothing ever reads.  As a capacity it only ever grows to the widest chunk's `T*K*N`.
+        if (!h_cpu.reserve(ent * N)) {
+            err = "qwen35moe prefill: the expert staging buffer could not be allocated";
+            return false;
+        }
         if (cudaMemcpyAsync(h_mixed.data(), bufs.mixed, h_mixed.size() * sizeof(float),
                             cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
             cudaStreamSynchronize(cs) != cudaSuccess) {
             err = "qwen35moe prefill: CPU activations did not download";
             return false;
         }
+        mark(false);
         const bool own_q2 = f.gu_type == 42 && q2_own_kernels();
         if (own_q2) h_act_q2.resize((size_t) T);
         for (int64_t t = 0; t < T; ++t) {
             if (own_q2) act_quant_any(h_mixed.data() + (size_t) t * N, (int) N, h_act_q2[(size_t) t]);
             else native_quant_act(f, h_mixed.data() + (size_t) t * N, h_act.data() + (size_t) t * kNativeActBytes);
         }
+        mark(false);
 
         cpu_jobs.clear();
         cpu_blobs.resize(n_experts);
         h_ptr.clear();
+        cpu_dst.clear();
+        size_t cpu_n = 0;   // the CPU entries seen so far: the row of `cpu_parts` the next one is written to
         std::vector<int32_t> starts{0}, dst, tok;
         for (int32_t e : h_ord) {
             const int32_t slot = cache && host_res ? host_res[(size_t) l * n_experts + (size_t) e] : -1;
@@ -469,7 +716,11 @@ struct Qwen35MoePrefill::Impl {
             for (int p = h_start[(size_t) e]; p < h_start[(size_t) e + 1]; ++p) {
                 if (own_q2) job.act[job.nt] = &h_act_q2[(size_t) h_tok[(size_t) p]];
                 job.nact[job.nt] = h_act.data() + (size_t) h_tok[(size_t) p] * kNativeActBytes;
-                job.out[job.nt++] = h_parts.data() + (size_t) h_dst[(size_t) p] * N;
+                // The compact row, not `parts`'s: the entry's own row of `parts` is where the merge puts it
+                // back, after the grouped launch has run, so nothing here is written by two producers.
+                job.out[job.nt++] = h_cpu.data() + cpu_n * N;
+                cpu_dst.push_back(h_dst[(size_t) p]);
+                ++cpu_n;
                 if (job.nt == MAXT) {
                     cpu_jobs.push_back(job);
                     job.nt = 0;
@@ -477,10 +728,27 @@ struct Qwen35MoePrefill::Impl {
             }
             if (job.nt) cpu_jobs.push_back(job);
         }
+        mark(false);
+        rb_cpu_jobs += (long long) cpu_jobs.size();
+        rb_res_experts += (long long) h_ptr.size();
+        for (const auto& j : cpu_jobs) rb_cpu_tokens += j.nt;
         pool->run_split_multi_native(f, cpu_jobs.data(), (int) cpu_jobs.size());
-        if (cudaMemcpyAsync(bufs.parts, h_parts.data(), h_parts.size() * sizeof(float),
-                            cudaMemcpyHostToDevice, cs) != cudaSuccess) {
-            err = "qwen35moe prefill: CPU expert results did not upload";
+        mark(true);
+        // The plan is ready and has two independent consumers: the CPU results go up the bus, the resident
+        // experts run on the device.  They write DISJOINT rows of `parts` (a CPU entry's row is written by the
+        // merge below, a resident expert's by the grouped launch), so nothing orders them against each other and
+        // running them in sequence only wasted the launch's time behind a DMA.  The upload therefore gets its own
+        // stream and the two are left to overlap; the merge then waits for both and puts the CPU rows back.
+        //
+        // THE LAUNCH IS ENQUEUED FIRST, ON PURPOSE.  When the staging buffer is pinned the results' copy is a
+        // real asynchronous DMA and the order would not matter.  When it is pageable - `cudaHostAlloc` refused,
+        // see `PinnedFloats` - the driver PACKS the staging buffer in the calling thread before it queues the
+        // transfer, so the copy blocks the host for its whole duration: enqueuing it first would hold the launch
+        // back by the entire upload and there would be no overlap at all, which is the whole point of the split.
+        const bool has_cpu = cpu_n > 0;
+        if (has_cpu && cudaMemcpyAsync(bufs.cpu_dst, cpu_dst.data(), cpu_n * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+            err = "qwen35moe prefill: the CPU expert results did not upload";
             return false;
         }
         const int32_t ng = (int32_t) h_ptr.size();
@@ -502,10 +770,34 @@ struct Qwen35MoePrefill::Impl {
                                                    bufs.g_dst, bufs.g_tok, ng, (int64_t) dst.size(),
                                                    bufs.xq, bufs.ex_scratch, bufs.parts, cs);
         }
-        // The local compact plan must outlive its asynchronous copies.
+        // The results' own DMA, now that the resident experts are already running beside it.
+        if (has_cpu &&
+            (cudaMemcpyAsync(bufs.cpu_parts, h_cpu.data(), cpu_n * N * sizeof(float),
+                             cudaMemcpyHostToDevice, cs2) != cudaSuccess ||
+             cudaEventRecord(ev_up, cs2) != cudaSuccess)) {
+            err = "qwen35moe prefill: the CPU expert results did not upload";
+            return false;
+        }
+        // The host waits on the upload's event, which is also what makes the merge's read of it safe.
+        if (has_cpu && cudaEventSynchronize(ev_up) != cudaSuccess) {
+            err = "qwen35moe prefill: the CPU expert results did not upload";
+            return false;
+        }
+        mark(false);
+        if (has_cpu) {
+            const dim3 sm((unsigned) ((N + 255) / 256), (unsigned) cpu_n);
+            scatter_rows_kernel<<<sm, 256, 0, cs>>>(bufs.parts, bufs.cpu_dst, bufs.cpu_parts, (int) N);
+        }
+        // The local compact plan and the merge must outlive their asynchronous copies and the launch above.
         if (cudaStreamSynchronize(cs) != cudaSuccess) {
             err = "qwen35moe prefill: resident experts did not complete";
             return false;
+        }
+        mark(false);
+        if (prof) {
+            ++rb_n;
+            for (int i = 0; i + 1 < 6; ++i)
+                rb_ms[i] += std::chrono::duration<double, std::milli>(tp[i + 1] - tp[i]).count();
         }
         return true;
     }
@@ -529,11 +821,19 @@ struct Qwen35MoePrefill::Impl {
 
         // The MoE half is the one that dominates a chunk, so its own stages are timed separately (slots 6-9);
         // the four are a breakdown of this half's slot and therefore sum to it.
+        Clock::time_point rp[5];
+        int rmark = 0;
+        const auto rmark_fn = [&](bool sync) {
+            if (prof) { if (sync) cudaStreamSynchronize(cs); rp[rmark] = Clock::now(); }
+            ++rmark;
+        };
         Impl::Phase p_route(this, 6);
+        rmark_fn(false);
         const core::WeightRef* wr = v.get("ffn_gate_inp.weight");
         if (!proj(gemm, wr, bufs.mixed_f16, bufs.mixed_bf, bufs.logits, T, v.name("ffn_gate_inp.weight"), err))
             return false;
         strata::kernels::router_top10(bufs.logits, (int) T, (int) NE, (int) K, bufs.ids, bufs.weights, cs);
+        rmark_fn(true);
 
         // ---- the shared expert
         const core::WeightRef* wsg = v.get("ffn_gate_shexp.weight");
@@ -567,14 +867,26 @@ struct Qwen35MoePrefill::Impl {
                   ": ffn_gate_inp_shexp.weight is not a resident BF16 vector";
             return false;
         }
+        {
+            static bool once = false;
+            if (prof && !once) {
+                once = true;
+                std::fprintf(stderr, "  shared weights: gate_f16=%d up_f16=%d down_f16=%d types %d/%d/%d\n",
+                             (int) nsw.gate_f16, (int) nsw.up_f16, (int) nsw.down_f16, nsw.gate_type,
+                             nsw.up_type, nsw.down_type);
+            }
+        }
         try {
+            const Clock::time_point sh_t0 = Clock::now();
             strata::kernels::shared_expert_multi((int) T, bufs.mixed, bufs.mixed_bf, nsw,
                                                  (const uint16_t*) wgi->data, bufs.sh_gate, bufs.sh_up,
                                                  bufs.sh_g, bufs.shared, N, FF, cs);
+            if (prof) rr_host_ms += std::chrono::duration<double, std::milli>(Clock::now() - sh_t0).count();
         } catch (const std::exception& e) {
             err = std::string("qwen35moe prefill: the shared expert failed: ") + e.what();
             return false;
         }
+        rmark_fn(true);
 
         // ---- the routed experts.  Their activation image is the q8_1 rows the CPU pool quantizes too, and the
         // group plan needs the ids on the host, which costs one synchronization per layer.
@@ -617,8 +929,15 @@ struct Qwen35MoePrefill::Impl {
             err = "qwen35moe prefill: the router's ids did not come back";
             return false;
         }
+        rmark_fn(false);
         strata::kernels::quantize_q8_1_rows(bufs.mixed, T, N, bufs.xq, cs);
+        rmark_fn(true);
         p_route.stop();
+        if (prof) {
+            ++rr_n;
+            for (int i = 0; i + 1 < 5; ++i)
+                rr_ms[i] += std::chrono::duration<double, std::milli>(rp[i + 1] - rp[i]).count();
+        }
         Impl::Phase p_plan(this, 7);
         src->begin_layer(l, h_ids.data(), (int64_t) ENT);
 
@@ -752,7 +1071,7 @@ uint64_t Qwen35MoePrefill::bytes_needed(const core::ModelGeometry& g, const core
     Alloc o;
     o.count_only = true;
     Buffers b;
-    carve_chunk(chunk, g, ss.k, o, b);
+    carve_chunk(chunk, g, ss.k, qsa_cap_for(ss), o, b);
     return (uint64_t) o.used;
 }
 
@@ -790,6 +1109,11 @@ bool Qwen35MoePrefill::init(const core::WeightTable& wt, const core::ModelGeomet
     m->host_res = host_res;
     m->chunk = chunk;
     m->cs = (cudaStream_t) stream;
+    if (cudaStreamCreateWithFlags(&m->cs2, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&m->ev_up, cudaEventDisableTiming) != cudaSuccess) {
+        err = "qwen35moe prefill: the CPU experts' upload stream could not be created";
+        return false;
+    }
     const char* cpu_prefill = std::getenv("MNTQ_PREFILL_CPU");
     m->pool = cpu_prefill && std::atoi(cpu_prefill) == 0 ? nullptr : pool;
     m->prof = std::getenv("MNTQ_PREFILL_PROF") != nullptr;
@@ -814,7 +1138,7 @@ bool Qwen35MoePrefill::init(const core::WeightTable& wt, const core::ModelGeomet
     Alloc o;
     o.cur = m->arena;
     o.left = (size_t) bytes;
-    carve_chunk(chunk, g, ss.k, o, m->bufs);
+    carve_chunk(chunk, g, ss.k, qsa_cap_for(ss), o, m->bufs);
     if (!o.ok) {
         err = "qwen35moe prefill: the chunk buffers do not fit the arena";
         return false;
@@ -938,6 +1262,20 @@ bool Qwen35MoePrefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::
         for (int i = 0; i < kNPhase; ++i)
             std::fprintf(stderr, "  %-10s %9.0f ms  (%lld calls, %.2f ms/call)\n", nm[i], m.t_ph[i],
                          (long long) m.n_ph[i], m.n_ph[i] ? m.t_ph[i] / (double) m.n_ph[i] : 0.0);
+        // The last two overlap now: "cpu upload" is the upload's own span and "merge+tail" is everything that
+        // was still outstanding when it finished (the resident launch's tail plus the merge), so their SUM - not
+        // either one alone - is the time the two branches cost.
+        static const char* const sn[5] = {"act quantize", "job build", "cpu pool run", "cpu upload",
+                                          "merge+tail"};
+        std::fprintf(stderr, "  routed_hybrid over %lld calls: cpu jobs %lld (%lld tokens), resident experts %lld\n",
+                     (long long) m.rb_n, m.rb_cpu_jobs, m.rb_cpu_tokens, m.rb_res_experts);
+        for (int i = 0; i < 5; ++i)
+            std::fprintf(stderr, "  %-16s %9.0f ms\n", sn[i], m.rb_ms[i]);
+        static const char* const rn[4] = {"router proj", "shared expert", "ids read-back", "act image"};
+        for (int i = 0; i < 4; ++i)
+            std::fprintf(stderr, "  %-16s %9.0f ms\n", rn[i], m.rr_ms[i]);
+        std::fprintf(stderr, "  %-16s %9.0f ms  (of the shared expert above; the rest is its GPU tail)\n",
+                     "shared host", m.rr_host_ms);
     }
     return true;
 }

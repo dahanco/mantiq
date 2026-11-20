@@ -418,11 +418,14 @@ inline void row_dot_k6(const uint8_t* row, int nblocks, const block_q8_K* const*
         const uint8_t* blk = row + (size_t) i * sizeof(block_q6_K);
         const __m128i scales = _mm_loadu_si128((const __m128i*) (blk + 192));
         const __m256i scales16 = _mm256_cvtepi8_epi16(scales);
-        __m256i acci[NT], subi[NT];
+        // The -32 offset term STARTS the accumulator negated instead of living in a second array: the integer
+        // lanes are exact either way, and the register it frees is what keeps the token group off the stack
+        // (this is the down kernel, so it is instantiated at the widest group the file allows).
+        __m256i acci[NT];
         for (int t = 0; t < NT; ++t) {
-            acci[t] = _mm256_setzero_si256();
             const __m256i bs = _mm256_loadu_si256((const __m256i*) y[t][i].bsums);
-            subi[t] = _mm256_slli_epi32(_mm256_madd_epi16(bs, scales16), 5);
+            acci[t] = _mm256_sub_epi32(_mm256_setzero_si256(),
+                                       _mm256_slli_epi32(_mm256_madd_epi16(bs, scales16), 5));
         }
         int is = 0;
         for (int j = 0; j < 2; ++j) {
@@ -457,10 +460,8 @@ inline void row_dot_k6(const uint8_t* row, int nblocks, const block_q8_K* const*
             }
         }
         const float dx = h2f(u16(blk + 208));
-        for (int t = 0; t < NT; ++t) {
-            const __m256i sumi = _mm256_sub_epi32(acci[t], subi[t]);
-            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(y[t][i].d * dx), _mm256_cvtepi32_ps(sumi), accf[t]);
-        }
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(y[t][i].d * dx), _mm256_cvtepi32_ps(acci[t]), accf[t]);
     }
     for (int t = 0; t < NT; ++t) res[t] = hsum_ggml(accf[t]);
 }
@@ -658,6 +659,48 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// `gu_rows`' pair for a pack whose gate and up slices are NOT adjacent in the file (a GGUF's per-expert gate
+// and up tensors sit at unrelated offsets), so `gu_rows`' single base cannot serve it.  The gain is the token
+// GROUP: one pass decodes the gate row and the up row for the same eight tokens, so a group pays the weight
+// read and the block decode once for both slices.  `dot_rows_nt`'s cap is four - it is shared with the
+// single-slice down kernels, whose accumulators need the registers this one does not.
+template <int TY, int NT>
+void dot_rows_pair(const uint8_t* gb, size_t g_row, const uint8_t* ub, size_t u_row, int n, const void* const* act,
+                   float* const* go, float* const* uo, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    float g[NT], u[NT];
+    const bool pd = TY == 29 && iq1m_pdep();
+    for (int r = r0; r < r1; ++r) {
+        row_dot_any<TY, NT>(gb + (size_t) r * g_row, nb, y, g, pd);
+        row_dot_any<TY, NT>(ub + (size_t) r * u_row, nb, y, u, pd);
+        for (int t = 0; t < NT; ++t) {
+            go[t][r] = g[t];
+            uo[t][r] = u[t];
+        }
+    }
+}
+
+template <int TY>
+void dot_rows_pair_nt(int nt, const uint8_t* gb, size_t g_row, const uint8_t* ub, size_t u_row, int n,
+                      const void* const* act, float* const* go, float* const* uo, int r0, int r1) {
+    switch (nt) {
+        case 1: dot_rows_pair<TY, 1>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 2: dot_rows_pair<TY, 2>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 3: dot_rows_pair<TY, 3>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 4: dot_rows_pair<TY, 4>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 5: dot_rows_pair<TY, 5>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 6: dot_rows_pair<TY, 6>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 7: dot_rows_pair<TY, 7>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        case 8: dot_rows_pair<TY, 8>(gb, g_row, ub, u_row, n, act, go, uo, r0, r1); break;
+        default: for (int t0 = 0; t0 < nt; t0 += 8) {   // (more than 8: groups of 8, the rows read again per group)
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
+            dot_rows_pair_nt<TY>(k, gb, g_row, ub, u_row, n, act + t0, go + t0, uo + t0, r0, r1);
+        }
+    }
+}
+
 // ---- one token (a decode step's CPU expert): ggml-cpu's own AVX2 dots for IQ3_XXS / IQ3_S with a cheaper decode -
 // IQ3_XXS's sign vectors built in registers (sgn7_vec's steps, as neg masks), IQ3_S's 9-bit grid indices
 // built in scalar registers (ggml builds them in vectors, stores and reloads them), the inner loop unrolled.  The
@@ -810,6 +853,16 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
                 int r0, int r1) {
     switch (type) {
 #define CASE(T) case T: dot_rows_nt<T>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        IQ256_TYPES(CASE)
+#undef CASE
+        default: break;
+    }
+}
+
+void iq256_gu_rows_pair(int type, const uint8_t* gate_base, size_t gu_row, const uint8_t* up_base, size_t up_row,
+                        int n, const void* const* act, int nt, float* const* go, float* const* uo, int r0, int r1) {
+    switch (type) {
+#define CASE(T) case T: dot_rows_pair_nt<T>(nt, gate_base, gu_row, up_base, up_row, n, act, go, uo, r0, r1); break;
         IQ256_TYPES(CASE)
 #undef CASE
         default: break;

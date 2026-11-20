@@ -30,6 +30,16 @@ if(MNTQ_CPU_PORTABLE)
 else()
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 endif()
+# IQK's mul-mat kernels drive the prompt path only (N >= 32), so decode is untouched.  They are AVX2 code
+# (ggml/src/iqk/iqk_config.h), and AVX-VNNI is a compile-time choice with no run-time test, so only this PC's
+# build gets VNNI.  MNTQ_IQK=OFF configures the engine without the kernels.
+option(MNTQ_IQK "use the IQK matrix multiplication kernels (the prompt path, N >= 32)" ON)
+set(GGML_IQK_MUL_MAT ${MNTQ_IQK} CACHE BOOL "ggml: use IQK matrix multiplication kernels" FORCE)
+if(MNTQ_CPU_PORTABLE)
+  set(GGML_AVX2 ON CACHE BOOL "" FORCE)
+else()
+  set(GGML_AVX_VNNI ON CACHE BOOL "" FORCE)
+endif()
 
 if(MNTQ_GGML_DIR)
   set(_mntq_llamacpp_dir ${MNTQ_GGML_DIR})

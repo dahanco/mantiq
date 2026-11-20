@@ -132,6 +132,31 @@ __global__ void scale_kernel(float* __restrict__ out, const float* __restrict__ 
     if (i < n) out[i] *= g[0];
 }
 
+/// `scalar_gate_kernel` for a whole window: one block per token, `<<<n_tok, 256>>>`.  The block is the same
+/// 256-thread reduction over the same stride, so a token's scalar is the number the single-token launch
+/// produced.  It exists because the alternative - the one-token launch once per token from inside the batched
+/// shared expert's column loop - is eight kernel launches per eight columns where the projections themselves
+/// need six, and on a 2048-token prompt that was most of `moe_route`'s 1.7 seconds.
+__global__ void scalar_gate_multi_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
+                                         float* __restrict__ out, int n_embd) {
+    __shared__ double scratch[8];   // 8 warps: the launch is <<<n_tok, 256>>>
+    const uint16_t* __restrict__ xt = x_bf16 + (size_t) blockIdx.x * n_embd;
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x)
+        acc += (double) f32_from_bf16(xt[i]) * (double) f32_from_bf16(w_bf16[i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    acc = warp_sum_d(acc);
+    if (lane == 0) scratch[warp] = acc;
+    __syncthreads();
+    const int nw = ((int) blockDim.x + 31) >> 5;
+    if (warp == 0) {
+        acc = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
+        acc = warp_sum_d(acc);
+        if (threadIdx.x == 0) out[blockIdx.x] = (float) (1.0 / (1.0 + exp(-acc)));
+    }
+}
+
 __global__ void native_scalar_sigmoid_kernel(float* gate) {
     // Match the single-token CUDA sigmoid's FP32 fast-math operations without changing legacy kernels'
     // compilation flags. The dot product was already reduced by the pinned native MMVF implementation.
@@ -181,15 +206,30 @@ void f16_proj_rows(const float* x, const uint16_t* w, float* y, int n_in, int n_
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream) {
-    // The native Q8_1 quantizer and multi-column MMVQ are compiled for at most 8 columns (MAX_NCOLS), so a wider
-    // window - the batched prompt read - is served in <=8-token chunks.  Every row's arithmetic is the same call
-    // it would have received on its own, so the result is bitwise identical to the token-by-token path.
-    if (n_tok > 8) {
-        for (int t0 = 0; t0 < n_tok; t0 += 8) {
-            const int cn = std::min(8, n_tok - t0);
+    // The native Q8_1 quantizer and multi-column MMVQ take at most 32 columns (MAX_NCOLS), and the resident F16
+    // GEMV at most 8, so a wider window - the batched prompt read - is served in tiles of those widths.  Every
+    // row's arithmetic is the same call it would have received on its own, so the result is bitwise identical to
+    // the token-by-token path.  The 32-column tiles exist because the cost here was almost entirely per-tile
+    // overhead: thousands of small windows, each with its own set of tiny launches, spent most of their time in
+    // the gaps between kernels rather than in the projections.
+    const int max_tile = (nw.gate_f16 || nw.up_f16 || nw.down_f16) ? 8 : 32;
+    // A window this function can hand its projections in ONE call - the launcher's widths are 2..8, 16, 24 and
+    // 32, and an F16 projection is capped at 8.  9..15, 17..23 and 25..31 are NOT among them, so testing
+    // `n_tok > max_tile` alone let exactly those windows fall through untiled and the launcher threw.  A prompt
+    // whose last chunk happened to be one of them failed the whole prefill; the fix is to tile any window that
+    // is not a single supported width.
+    const bool one_call = n_tok <= 8 || (max_tile >= 32 && (n_tok == 16 || n_tok == 24 || n_tok == 32));
+    if (!one_call) {
+        for (int t0 = 0; t0 < n_tok;) {
+            const int rem = n_tok - t0;
+            const int cn = (max_tile >= 32 && rem >= 32) ? 32
+                         : (max_tile >= 32 && rem >= 24) ? 24
+                         : (max_tile >= 32 && rem >= 16) ? 16
+                                                         : std::min(8, rem);
             shared_expert_multi(cn, x + (size_t) t0 * n_embd, x_bf16 + (size_t) t0 * n_embd, nw, gate_inp_bf16,
                                 gate + (size_t) t0 * n_ff, up + (size_t) t0 * n_ff, g + t0,
                                 out + (size_t) t0 * n_embd, n_embd, n_ff, stream);
+            t0 += cn;
         }
         return;
     }
@@ -201,9 +241,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     const bool gate_nat = !gate_f16 && nw.gate_data != nullptr && native_mmvq_supported(nw.gate_type);
     const bool up_nat = !up_f16 && nw.up_data != nullptr && native_mmvq_supported(nw.up_type);
     const bool down_nat = !down_f16 && nw.down_data != nullptr && native_mmvq_supported(nw.down_type);
-    if (n_tok < 1 || n_tok > 8 || !stream || !(gate_f16 || gate_nat) || !(up_f16 || up_nat) ||
+    if (n_tok < 1 || n_tok > 32 || !stream || !(gate_f16 || gate_nat) || !(up_f16 || up_nat) ||
         !(down_f16 || down_nat) || ((gate_nat || up_nat || down_nat) && !nw.q8_1))
-        throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
+        throw std::invalid_argument("shared_expert_multi: needs 1..32 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
     if (gate_nat || up_nat) native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
     if (gate_f16)
@@ -226,14 +266,15 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         native_scalar_sigmoid_multi_kernel<<<1, n_tok, 0, cs>>>(g);
+    } else if (!native_bf16) {
+        // One block per token, `<<<n_tok, 256>>>`: same 256-thread reduction over the same stride as the
+        // per-token `scalar_gate_kernel` it replaces, so a token's scalar is bitwise the number that launch
+        // produced - but one launch for the whole window instead of one per token.
+        scalar_gate_multi_kernel<<<(unsigned) n_tok, 256, 0, cs>>>(x_bf16, gate_inp_bf16, g, (int) n_embd);
     } else
     for (int t = 0; t < n_tok; ++t) {
-        if (native_bf16) {
-            bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-            native_scalar_sigmoid_kernel<<<1, 1, 0, cs>>>(g + t);
-        } else {
-            scalar_gate_kernel<<<1, 256, 0, cs>>>(x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-        }
+        bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+        native_scalar_sigmoid_kernel<<<1, 1, 0, cs>>>(g + t);
     }
     scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
         out, g, (int) n_embd);

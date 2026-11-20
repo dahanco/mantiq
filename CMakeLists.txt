@@ -1121,6 +1121,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+option(STRATA_IQK "use the IQK matrix multiplication kernels for the prompt path (N >= 32)" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
@@ -1134,6 +1135,9 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  # IQK mul-mat kernels for the prompt path (N >= 32): decode keeps its own path, so decode speed is
+  # unchanged.  STRATA_IQK=OFF builds ggml without them.
+  set(GGML_IQK_MUL_MAT ${STRATA_IQK} CACHE BOOL "ggml: use IQK matrix multiplication kernels" FORCE)
   if(NOT STRATA_CPU_X86)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     if(NOT GGML_CPU_ARM_ARCH)

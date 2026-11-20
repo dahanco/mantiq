@@ -186,6 +186,41 @@ RowsFn exact_rows1(int type) {
 // the exact rows for nt tokens of a weight type (nt >= 1), nullptr: ggml-cpu's dot
 RowsFn exact_rows_nt(int type, int nt) { return nt >= 2 ? exact_rows(type) : exact_rows1(type); }
 
+// The pair rows' GATE half in the `RowsFn` shape so `rows_match_ggml` can check it: the up half is the same
+// `row_dot_any` call with the other base, so one check covers both.  Its up output is scratch no one reads.
+void pair_gate_probe(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                     float* const* out, int r0, int r1) {
+    thread_local std::vector<float> ubuf;
+    thread_local std::vector<float*> uo;
+    const int nr = r1 - r0;
+    ubuf.resize((size_t) nt * (size_t) nr);
+    uo.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) uo[(size_t) t] = ubuf.data() + (size_t) t * (size_t) nr;
+    iq256_gu_rows_pair(type, w, row_bytes, w, row_bytes, n, act, nt, out, uo.data(), r0, r1);
+}
+
+// true when `iq256_gu_rows_pair` serves `type` on this CPU and is exact here (picked and checked once).  It is
+// offered only where the AVX-2 rows are the ones in use: the pair kernel is AVX-2, and on a machine that runs
+// the AVX-512 rows the pair would replace them rather than add to them.
+bool pair_rows_exact(int type) {
+    if (type < 0 || type >= GGML_TYPE_COUNT) return false;
+    static std::once_flag once[GGML_TYPE_COUNT];
+    static bool ok[GGML_TYPE_COUNT];
+    std::call_once(once[type], [type] {
+        const char* mt = std::getenv("STRATA_GLM_CPU_MT");
+        if (mt != nullptr && std::atoi(mt) == 0) return;
+        if (!cpu_avx2_ok() || std::getenv("STRATA_NO_IQ256") != nullptr) return;
+        if (cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr && iq512_supported(type)) return;
+        init_once();
+        if (!iq256_supported(type)) return;
+        ok[type] = rows_match_ggml(pair_gate_probe, type);
+        if (!ok[type])
+            std::fprintf(stderr, "native experts: the gate/up pair %s rows differ from ggml-cpu's dot in this "
+                                 "build - ggml's dots for them\n", ggml_type_name((ggml_type) type));
+    });
+    return ok[type];
+}
+
 }  // namespace
 
 bool native_experts_available() noexcept { return true; }
@@ -318,8 +353,16 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                 go[(size_t) t] = buf.data() + (size_t) t * nr;
                 uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
             }
-            gfn(f.gu_type, gate_base + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, go.data(), 0, nr);
-            ufn(f.up_type, up_base + (size_t) r0 * f.up_row, f.up_row, n, act, nt, uo.data(), 0, nr);
+            if (f.up_type == f.gu_type && pair_rows_exact(f.gu_type)) {
+                // one pass per token group over BOTH slices: the group's weight reads and its block decode
+                // are paid once instead of once per slice (this pack's slices are not adjacent)
+                iq256_gu_rows_pair(f.gu_type, gate_base + (size_t) r0 * f.gu_row, f.gu_row,
+                                   up_base + (size_t) r0 * f.up_row, f.up_row, n, act, nt, go.data(), uo.data(),
+                                   0, nr);
+            } else {
+                gfn(f.gu_type, gate_base + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, go.data(), 0, nr);
+                ufn(f.up_type, up_base + (size_t) r0 * f.up_row, f.up_row, n, act, nt, uo.data(), 0, nr);
+            }
             for (int t = 0; t < nt; ++t) {
                 for (int r = 0; r < nr; ++r) {
                     float g = go[(size_t) t][r], u = uo[(size_t) t][r];

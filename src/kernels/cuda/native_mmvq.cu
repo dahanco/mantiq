@@ -855,7 +855,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
     }
 }
 
-// ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
+// ============================ plan v0.3 P3: ncols = 2..32 (speculative verify, small batches, shared expert) ============================
 //
 // One generic kernel for every format, parameterized by the format's iteration traits below, which are
 // transcribed from the ncols = 1 kernels above (same thread-to-block mapping, same blocks per iteration, same
@@ -863,7 +863,14 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
 // row) value is accumulated over kbx in the same order, summed across warps in the same order and reduced with
 // the same warp tree as the ncols = 1 kernel, so every column is BITWISE equal to a single-column call on that
 // column. The ncols = 1 kernels are untouched.
-constexpr int MAX_NCOLS = 8;
+//
+// 2..8 are the tiny batches the verify path needs and use the layout above unchanged. 16/24/32 exist for the
+// shared expert, whose window is thousands of tokens and whose cost was almost entirely the per-8-column tile
+// overhead: a wider tile reads the same weight block once for twice or four times as many columns, and cuts the
+// kernel count per call by the same factor. They go through `launch_multi_wide`, which pins NW = WARPS and
+// ROWS = 1 - the ROWS dimension only decides how many output rows a block covers, never the order a single
+// (column, row) accumulates in, so the values are identical to what the 2..8 layout would have produced.
+constexpr int MAX_NCOLS = 32;
 
 // Each format splits its dot product into `load` (everything that depends only on the weight block: codes,
 // unpacked scales, block scale) and `apply` (the activation loads and the original *_impl expression). `load` runs
@@ -1168,6 +1175,18 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     }
 }
 
+template<typename F, int NCOLS>
+void launch_multi_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+    // One output row per block and NW = WARPS warps: the register array is `tmp[NCOLS][1]` and the cross-warp
+    // scratch stays `(WARPS-1) * NCOLS * WARP` floats, both linear in NCOLS, where the small-K layout would have
+    // needed NCOLS times the row count. A single (column, row) still accumulates over kbx with the same BPI and
+    // the same warp tree, so the values match the narrower layouts.
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const dim3 threads(WARP, WARPS);
+    native_mmvq_multi_kernel<F, NCOLS, WARPS, 1><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+}
+
 template<typename F>
 void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                   void* stream) {
@@ -1180,7 +1199,10 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
+        case 16: launch_multi_wide<F, 16>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 24: launch_multi_wide<F, 24>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 32: launch_multi_wide<F, 32>(weights, x_q8_1, y, n_in, n_out, s); break;
+        default: throw std::invalid_argument("native MMVQ multi-column launch requires ncols in {2..8, 16, 24, 32}");
     }
 }
 
@@ -1188,7 +1210,7 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 32");
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {

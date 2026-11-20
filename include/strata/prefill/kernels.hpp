@@ -74,6 +74,15 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
+/// The two splits with the head geometry as arguments, for architectures that do not run at 24 x 256
+/// (qwen35moe's full-attention layers carry 16 heads at head_dim 256).  q_full is [n_q, n_head, 2 * hd],
+/// q/attn are [n_q, n_head, hd].
+void split_q_heads(const float* q_full, float* q, int64_t n_q, int64_t n_head, int64_t hd, void* stream);
+void gate_attn_heads(const float* attn, const float* q_full, uint16_t* out16, int64_t n_q, int64_t n_head, int64_t hd,
+                     void* stream);
+/// The identity selection of the indexer-free full-attention layers as a [n_q, cap] table: ids[q, j] = j
+/// (the same cells `topk` returns when every score is equal).
+void iota_rows(int32_t* ids, int64_t n_q, int64_t cap, void* stream);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.

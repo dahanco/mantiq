@@ -144,6 +144,28 @@ void pin_this_thread(int core) {
 #endif
 }
 
+/// **THE ROW-PHASE TASK COUNT.**  The tasks of a rows phase are its row partition, claimed dynamically, so this
+/// is what decides how long the barrier after the phase waits for the slowest worker.  An efficiency core runs
+/// at about half a performance core's rate, and at llama.cpp's "about three tasks per thread" the phase ends a
+/// whole task after the last fast worker finished - the barrier waits on the straggler, and adding E-cores made
+/// the prefill SLOWER (11 workers 22007 ms, 7 performance-only 16920 ms on an i7-12700K, Qwopus3.6 35B A3B).
+/// With finer tasks the fast cores take the straggler's share instead: 48 a thread measured 12095 ms with all
+/// 11 workers, and the tail overhead only outgrew the gain past ~96.  `STRATA_POOL_TASKS_PER_THREAD` is a test
+/// knob.  A task still needs rows (an empty one costs a claim and a barrier slot), so the count is capped by
+/// `rows / kMinRowsPerTask` - a small batch falls back to fewer, still-balanced tasks.
+constexpr int kMinRowsPerTask = 8;
+
+int row_tasks(int threads, int64_t rows) {
+    static const int per_thread = [] {
+        const char* e = std::getenv("STRATA_POOL_TASKS_PER_THREAD");
+        const int n = e != nullptr ? std::atoi(e) : 48;
+        return n > 0 ? n : 48;
+    }();
+    const int64_t want = (int64_t) per_thread * threads;
+    const int64_t fit = (rows + kMinRowsPerTask - 1) / kMinRowsPerTask;
+    return (int) (std::max)((int64_t) 1, (std::min)(want, (std::max)(fit, (int64_t) 1)));
+}
+
 }  // namespace
 
 long long pin_current_thread(int core) {
@@ -520,8 +542,8 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
-    mtasks_ = 3 * threads;
     mrows_ = (int64_t) n * FF;
+    mtasks_ = row_tasks(threads, mrows_);
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
@@ -529,6 +551,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
             act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * H;
+    mtasks_ = row_tasks(threads, mrows_);
     run_phase(4, mtasks_);
     const auto t3 = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -548,8 +571,8 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * f.n_ff;
+        mtasks_ = row_tasks(threads, mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
@@ -559,6 +582,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
+        mtasks_ = row_tasks(threads, mrows_);
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
