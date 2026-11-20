@@ -28,6 +28,7 @@
 // or not for a long stretch, is tried when its drafts are likely to hold. The lookup's calls above never touch any of it (band 0, as before).
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <string>
 
@@ -49,6 +50,16 @@ public:
     Pick choose(int t_mtp, int lookup_k, int match) const;
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
+
+    // --lookup-max-t: only these window sizes may be chosen for a lookup.  Bit t = size t; size 1 is always kept.
+    void set_sizes(unsigned mask) { sizes_ = mask | 2u; }
+    void disable(int t) { if (t > 1 && t <= kMaxT) sizes_ &= ~(1u << t); }
+    bool allowed(int t) const { return t >= 1 && t <= max_t_ && ((sizes_ >> t) & 1u); }
+    int fit(int t) const {
+        for (t = std::min(t, max_t_); t > 1; --t)
+            if (allowed(t)) return t;
+        return 1;
+    }
 
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens (this band's)
@@ -92,6 +103,7 @@ private:
 
     int max_t_;
     double margin_;
+    unsigned sizes_ = ~0u;     ///< allowed lookup window sizes (all, unless --lookup-max-t narrows them)
     int band_ = 0;                                         // (0 unless set_context moved it)
     double rounds_ = 0;                                    // observe_cost() calls so far
     std::array<std::array<double, kMaxT + 1>, kBands> cost_{}, cost_n_{};   // round ms by band and window size

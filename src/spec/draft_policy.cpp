@@ -75,14 +75,23 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     if (lookup_k <= 0) return p;
     const double base = mtp_tokens(p.t) / cost_ms(p.t);
     const double q = lookup_rate(match);
+    const int b = bucket(match);
+    const double seen = ok_[(size_t) b] + bad_[(size_t) b];
+    // A 12-row window costs as much as several narrow ones.  Before the match-length bucket has shown that its
+    // continuation really holds (not just the prior), let lookup use only the MTP's width plus two rows.  A rewrite
+    // whose copies all repeat gives that evidence in a few rounds; a coincidental match in ordinary text never does.
+    const int wide_from = std::max(t_mtp + 2, 4);
+    const auto wide_ok = [&](int t) { return t <= wide_from || (seen >= kProbes && q >= 0.95); };
     double e = 1.0, qi = 1.0, best = 0.0;
     int best_t = 0;
     for (int k = 1; k <= std::min(lookup_k, max_t_ - 1); ++k) {
         qi *= q;
         e += qi;
+        if (!allowed(k + 1) || !wide_ok(k + 1)) continue;   // --lookup-max-t: MTP keeps its narrow windows
         const double r = e / cost_ms(k + 1);
         if (r > best) { best = r; best_t = k + 1; }
     }
+    const int t_full = fit(std::min(lookup_k, max_t_ - 1) + 1);
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
         p.t = best_t;
@@ -90,8 +99,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
-    if (t_full > p.t && cost_n_[(size_t) band_][t_full] < kProbes && q >= 0.85) {
+    if (t_full > p.t && wide_ok(t_full) && cost_n_[(size_t) band_][t_full] < kProbes && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
