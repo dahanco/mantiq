@@ -17,9 +17,11 @@ Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMa
 Tokens per second, decoding only, on one file: `Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf` (Qwen 35B-A3B MoE, Q4_K_M),
 RTX 3070 8 GB, i7-12700K, 32 GB RAM, Windows. Mantiq ran its CUDA path; the llama.cpp build at hand is Vulkan-only (no
 `ggml-cuda.dll`), and `-ncmoe 32` was the best of a 28-38 sweep because 20.2 GiB of weights do not fit in 8 GB of VRAM.
-Reading the prompt is the other half of the story, and there llama.cpp wins: it is about 1.2x faster at prefill, since
-the Qwen MoE path ships with `--prefill 0`. Generating the answer - what a person waiting at the keyboard sees - is
-where the gap goes the other way.
+Reading the prompt is the other half of the story. The batched Qwen MoE prompt path now sizes its chunk to the free
+VRAM (4096 tokens on an 8 GB card; up to 8192 where it fits), raising the 5311-token test prompt from 295.7 tok/s at
+the old fixed 2048-token chunk to 301-309 tok/s. llama.cpp CUDA reads the same prompt at 356.4 tok/s (`pp5312`), so
+Mantiq is now roughly 13-15% behind on prefill instead of 17%. Generating the answer - what a person waiting at the
+keyboard sees - is where the gap goes the other way.
 
 Mantiq is an inference engine. It is not a wrapper around someone else's runtime, and it is not a model server that
 hands the work to a library: it *is* the runtime - the kernels, the memory tiers, the tuner, the server and the
@@ -39,6 +41,11 @@ A model this size does not fit in VRAM. Mantiq plans around that instead of pret
   and no Python in the decode loop.
 - **It serves you, not just the model.** A chat and a live Monitor in the browser, pictures on every model, thinking
   levels, an OpenAI- and Anthropic-compatible API with streamed tool calls, and several requests answered at once.
+- **It remembers the shared prompt.** The native `--serve` path keeps a chain of conversation checkpoints at turn
+  boundaries, generation seams and periodic chunk ends. An agent that re-sends the whole conversation every request
+  (OpenCode and other OpenAI-compatible clients) mounts the longest matching one, so a tool call, a reasoning turn or
+  a rewritten older message re-reads only the suffix after the divergence - not the whole session. Retention is set by
+  `--prompt-cache`, `--prompt-cache-every` and `--turn-token`.
 
 ## How it works
 

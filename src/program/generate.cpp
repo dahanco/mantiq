@@ -490,7 +490,8 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
-                 "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
+                 "                       the largest chunk up to 8192 whose buffers fit the card (lent cache slots,\n"
+                  "                       or qwen35moe's own arena)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -4958,10 +4959,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mntq generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
-        o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
-        o.prefill_chunk = 2048;
-    }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;
@@ -5370,6 +5367,10 @@ int main(int argc, char** argv) {
             return (int64_t) (strata::prefill::Qwen35MoePrefill::bytes_needed(g, ss, chunk) >> 20) + 64;
         return 160 + (chunk * 680) / 1024;
     };
+    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty()) && !qm_prompt) {
+        o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
+        o.prefill_chunk = 2048;
+    }
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
     // half copies are issued from inside `block_layer_pre`/`block_layer_post`, so they are only ever enqueued
@@ -5868,6 +5869,31 @@ int main(int argc, char** argv) {
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
+        // qwen35moe borrows no cache slots: its arena and the expert cache carve the SAME measured free VRAM.
+        // Pick the largest batch (up to 8192, what `--prefill auto` asks for) that leaves the cache a real
+        // residency table - an 8192-token arena takes every slot and the later --spec check fails even though
+        // prefill itself is fast.  The module repeats the fit against what is free after the cache is loaded,
+        // so a chunk that still cannot fit is halved rather than paged to system memory under WDDM.
+        if (qm_prompt && o.prefill_chunk > 0) {
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t min_slots = 256;
+            const int64_t ceiling = o.prefill_auto ? 8192 : std::min<int64_t>(o.prefill_chunk, 8192);
+            int64_t fit = 256;
+            // 6144 was measured (301-304 tok/s) but 4096 is faster (309) here, so auto stops at 4096; 3072 is
+            // kept as a finer fallback for cards where the 4096 arena leaves too few expert-cache slots.
+            for (const int64_t c : {8192, 4096, 3072, 2048, 1024, 512, 256}) {
+                if (c > ceiling) continue;
+                const int64_t reserve_mib = o.vram_reserve_mib + prompt_path_mib(c);
+                const int64_t slots = ((int64_t) free_b - (reserve_mib << 20)) / blob;
+                if (slots >= min_slots) { fit = c; break; }
+            }
+            if (fit != o.prefill_chunk)
+                std::fprintf(stderr, "mntq generate: qwen35moe prompt chunk %lld -> %lld tokens so the arena and "
+                                     "the expert cache both fit (%.2f GiB free)\n",
+                             (long long) o.prefill_chunk, (long long) fit, (double) free_b / 1073741824.0);
+            o.prefill_chunk = fit;
+            o.prefill_auto = false;   // the largest fitting batch is now concrete for every prompt path
+        }
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; the
@@ -9454,15 +9480,16 @@ int main(int argc, char** argv) {
             // request, so this is the record its prefix is matched against; `--repl` only ever needs the tail.
             std::vector<int64_t> hist;
             bool fresh = false;
-            // PARTIAL REUSE.  The running state as it stands at a turn's generation start, where a reasoning
-            // model's `<think>` block is the first thing to grow from.  The client re-sends that turn WITHOUT the
-            // block, so the next request's tokens break off exactly here though every position before it is
-            // unchanged - the divergence branch below restores this and reads only the request's own tail.  Only
-            // the GDN recurrence and the QSA tail need saving: the attention K/V under the rewind point is left
-            // alone and the cells above it are overwritten by the tail's own read.
-            ConvCheckpoint partial;
-            int64_t partial_p = 0;
-            bool partial_valid = false;
+            // CONVERSATION CHECKPOINTS.  A K/V cache can be truncated at any position; a GDN recurrence (and a
+            // QSA indexer tail) cannot, so prefix reuse needs a snapshot of the running state at every point a
+            // client may branch from: the system-prompt root, each turn boundary, the generation seam (`open=N`,
+            // where a re-sent turn drops the `<think>` block), and - for prompts with no turn tokens - periodic
+            // chunk ends.  Kept as a chain sorted by length; the shortest (root) is pinned and the rest rotate on
+            // LRU (`--prompt-cache N`, ~63 MiB each on qwen35moe).  A request resumes from the LONGEST checkpoint
+            // whose tokens are a prefix of its own, so a divergence in an older tool turn re-reads only from
+            // there - the llama.cpp prompt cache's behaviour, which one generation-seam checkpoint cannot give.
+            std::vector<ConvCheckpoint> checks;
+            uint64_t check_clock = 0;
             // The reader thread's own flag (set up below): a STOP has to reach a request that is still running.
             std::atomic<bool> stop_req{false};
             // A NEW CONVERSATION ON THE SAME RESIDENCY (`RESET`, the page's New chat; also a `--serve` request
@@ -9484,11 +9511,41 @@ int main(int argc, char** argv) {
                 if (cudaDeviceSynchronize() != cudaSuccess) return false;
                 ver.reset();
                 hist.clear();
-                partial_valid = false;   // the sequence it was taken from no longer exists
+                checks.clear();   // every snapshot belongs to the sequence that no longer exists
                 p = 0;
                 x = 0;
                 fresh = true;
                 return true;
+            };
+            // Snapshot the running state at the current position (`hist.size() == p`) unless an equal-length
+            // snapshot already exists.  Sorted by length so the chain stays a chain; eviction pins the root and
+            // drops the least recently used leaf (conv_cache.hpp).  Only the GDN recurrence, the QSA tails and
+            // the PLE history are copied - the positional K/V under the cut stays put and the tail overwrites it.
+            auto save_check = [&](const char* why) {
+                if (o.prompt_cache <= 0 || !native_serve || !stages.empty() || p < 1 || (size_t) p != hist.size())
+                    return;
+                for (auto& c : checks)
+                    if ((int64_t) c.ids.size() == p) { c.used = ++check_clock; return; }
+                ConvCheckpoint c;
+                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) {
+                    std::fprintf(stderr, "mntq repl: checkpoint at %lld NOT saved\n", (long long) p);
+                    return;
+                }
+                c.ids.assign(hist.begin(), hist.end());
+                c.used = ++check_clock;
+                const auto at = std::upper_bound(checks.begin(), checks.end(), p,
+                    [](int64_t v, const ConvCheckpoint& q) { return v < (int64_t) q.ids.size(); });
+                checks.insert(at, std::move(c));
+                while ((int64_t) checks.size() > o.prompt_cache) {
+                    std::vector<uint64_t> stamps;
+                    stamps.reserve(checks.size());
+                    for (const auto& q : checks) stamps.push_back(q.used);
+                    const size_t victim = strata::program::conv_cache::eviction_victim(
+                        stamps.data(), stamps.size(), o.prompt_cache);
+                    checks.erase(checks.begin() + (ptrdiff_t) victim);
+                }
+                std::fprintf(stderr, "mntq repl:   -> checkpoint at %lld (%s), %zu in chain\n",
+                             (long long) p, why, checks.size());
             };
             // Read a turn's tokens.  `t[0]` is the token pending at the current position `p` (the last one the
             // engine emitted), the rest follow it; every token but the last is committed and the last becomes the
@@ -9770,52 +9827,65 @@ int main(int argc, char** argv) {
                 int64_t reused = 0;
                 bool whole_prompt = fresh;
                 if (native_serve) {
-                    // `hist` is the committed prefix (positions 0..p-1) and the request's token at index
-                    // `hist.size()` is the state's own pending token - the last thing it emitted - when the request
-                    // is this conversation's continuation.  `reused` is what the resident state already holds.
+                    // The resident state holds `hist` (positions 0..p-1) and the pending `x` at p.  A request is
+                    // a continuation when its tokens extend exactly that prefix with `x` at the split - then only
+                    // the new tail is read.  Otherwise search the checkpoint chain for the LONGEST snapshot whose
+                    // tokens are a prefix of this request and rewind there: a divergence in an older tool turn
+                    // then costs only the tokens after that turn, not the whole conversation.
                     size_t L = 0;
                     while (L < hist.size() && L < ids.size() && hist[L] == ids[L]) ++L;
-                    if (!whole_prompt &&
-                        (L != hist.size() || L >= ids.size() || ids[L] != (int64_t) x)) whole_prompt = true;
-                    if (whole_prompt) {   // not a continuation of this state: the sequence starts over, prompt whole
-                        // PARTIAL REUSE.  `ids` is not a continuation of `hist`, but it can still share a prefix
-                        // with the state we checkpointed at the last turn's generation start (PARTIAL, below): a
-                        // reasoning model emits a <think> block and KEEPS it in the sequence, while the client
-                        // re-sends that same turn WITHOUT the block - so the match breaks at the block's first
-                        // token while every position before it is unchanged.  Reading the whole conversation again
-                        // for that would discard the very cache this path exists for, so when the checkpoint covers
-                        // the divergence, rewind to it and read only the tail.  `L` is the common prefix; the
-                        // checkpoint is a prefix of it, and `ids[partial_p]` is the token that was pending then
-                        // (the checkpoint's own `x`) - exactly what the delta branch below hands `read_turn`.
-                        if (!fresh && partial_valid && (int64_t) L >= partial_p && !ids.empty()) {
-                            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(partial, ss, g)) {
+                    const bool cont = (L == hist.size() && L < ids.size() && ids[L] == (int64_t) x);
+                    int64_t best = -1;
+                    size_t best_i = 0;
+                    bool from_live = false;
+                    if (cont) { best = (int64_t) L; from_live = true; }
+                    for (size_t i = 0; i < checks.size(); ++i) {
+                        const int64_t cl = (int64_t) checks[i].ids.size();
+                        if (cl <= best || cl >= (int64_t) ids.size()) continue;
+                        bool match = true;
+                        for (int64_t j = 0; j < cl; ++j)
+                            if (checks[i].ids[(size_t) j] != ids[(size_t) j]) { match = false; break; }
+                        if (match) { best = cl; best_i = i; from_live = false; }
+                    }
+                    whole_prompt = (best < 0);
+                    if (best >= 0) {
+                        if (from_live) {
+                            reused = best;
+                            turn.reserve(ids.size() - L);
+                            turn.push_back((int64_t) x);   // the pending token is read back first
+                            turn.insert(turn.end(), ids.begin() + (ptrdiff_t) (L + 1), ids.end());
+                            std::fprintf(stderr, "mntq repl:   -> delta reuse %lld\n", (long long) L);
+                        } else {
+                            if (cudaDeviceSynchronize() != cudaSuccess ||
+                                !checkpoint_restore(checks[best_i], ss, g)) {
                                 turn_failed("the context restore failed");
                                 continue;
                             }
-                            hist.resize((size_t) partial_p);
-                            p = partial_p;
+                            if (use_mtp) mtp.kv_restore(best);
+                            checks[best_i].used = ++check_clock;
+                            hist.resize((size_t) best);
+                            p = best;
                             x = 0;   // read_turn sets it from the turn's own last token
-                            reused = partial_p;
-                            turn.assign(ids.begin() + (ptrdiff_t) partial_p, ids.end());
-                            whole_prompt = false;
-                            partial_valid = false;   // taken again at this turn's generation start
-                            std::fprintf(stderr, "mntq repl:   -> partial restore at pp=%lld, tail %lld tokens\n",
-                                         (long long) partial_p, (long long) turn.size());
-                        } else {
-                            if (!fresh && !ctx_reset()) {
-                                turn_failed("the context reset failed");
-                                continue;
-                            }
-                            turn = ids;
-                            std::fprintf(stderr, "mntq repl:   -> ctx_reset, prompt %lld tokens\n",
-                                         (long long) ids.size());
+                            reused = best;
+                            turn.assign(ids.begin() + (ptrdiff_t) best, ids.end());
+                            // every snapshot past the resume point belongs to the branch we are leaving
+                            checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& q) {
+                                if ((int64_t) q.ids.size() > best) return true;
+                                for (size_t j = 0; j < q.ids.size(); ++j)
+                                    if (q.ids[j] != ids[j]) return true;
+                                return false;
+                            }), checks.end());
+                            std::fprintf(stderr, "mntq repl:   -> checkpoint restore at pp=%lld, tail %lld tokens\n",
+                                         (long long) best, (long long) turn.size());
                         }
                     } else {
-                        reused = (int64_t) L;
-                        turn.reserve(ids.size() - L);
-                        turn.push_back((int64_t) x);   // the pending token is read back, then what follows it
-                        turn.insert(turn.end(), ids.begin() + (ptrdiff_t) (L + 1), ids.end());
-                        std::fprintf(stderr, "mntq repl:   -> delta reuse %lld\n", (long long) L);
+                        if (!fresh && !ctx_reset()) {
+                            turn_failed("the context reset failed");
+                            continue;
+                        }
+                        turn = ids;
+                        std::fprintf(stderr, "mntq repl:   -> ctx_reset, prompt %lld tokens\n",
+                                     (long long) ids.size());
                     }
                 } else if (whole_prompt) {
                     turn = ids;
@@ -9831,56 +9901,52 @@ int main(int argc, char** argv) {
                 }
                 std::string e;
                 const Clock::time_point read_t0 = Clock::now();
-                // PARTIAL REUSE, in the shape of llama.cpp's prompt cache.  The template's generation prompt wrote
-                // `req_open` tokens at the END of this prompt (the assistant header and, for a reasoning model, its
-                // opening `<think>`); the client re-sends the conversation next turn but NOT those tokens, so its
-                // prompt breaks off exactly there.  So the read is split at that seam and the state is checkpointed
-                // between the halves - the next request rewinds to it and reads only its own tail instead of the whole
-                // conversation.  (A GDN recurrence cannot be truncated the way K/V can, so the snapshot is what a
-                // rewind needs; without the split the checkpoint sat past the break and never matched.)
-                partial_valid = false;
-                bool seam_saved = false;
-                if (native_serve && stages.empty() && req_open > 0 && (int64_t) turn.size() > req_open + 1) {
-                    const int64_t cut = (int64_t) turn.size() - req_open + 1;   // read through the seam's own position
-                    std::vector<int64_t> head(turn.begin(), turn.begin() + (ptrdiff_t) cut);
-                    std::vector<int64_t> tail(turn.begin() + (ptrdiff_t) (cut - 1), turn.end());
-                    if (!read_turn(head, e)) {
-                        turn_failed(e);
-                        continue;
+                // READ THE TURN, SAVING A CHECKPOINT AT EACH TURN/SEAM BOUNDARY.  The cut points are indices in
+                // `turn` (whose element 0 is the pending token): the generation seam (`open=N`), every
+                // `<|im_start|>` after the first (a conversation turn), and periodic chunk ends.  read_turn takes
+                // the boundary token as the NEXT segment's pending one, so consecutive segments overlap there.
+                // A re-sent conversation that diverges at any of them rewinds to that point instead of reading
+                // the whole prompt again - llama.cpp's prefix cache, which one seam snapshot could not give.
+                std::vector<int64_t> cut_at;
+                if (native_serve && o.prompt_cache > 0 && stages.empty() && turn.size() > 2) {
+                    const int64_t n = (int64_t) turn.size();
+                    if (req_open > 0 && n - req_open > 0 && n - req_open < n - 1)
+                        cut_at.push_back(n - req_open);
+                    if (o.turn_token >= 0)
+                        for (int64_t i = 1; i + 1 < n; ++i)
+                            if (turn[(size_t) i] == (int64_t) o.turn_token) cut_at.push_back(i);
+                    if (o.prompt_cache_every > 0)
+                        for (int64_t i = o.prompt_cache_every; i + 1 < n; i += o.prompt_cache_every)
+                            cut_at.push_back(i);
+                    std::sort(cut_at.begin(), cut_at.end());
+                    cut_at.erase(std::unique(cut_at.begin(), cut_at.end()), cut_at.end());
+                }
+                bool read_ok = true;
+                if (cut_at.empty()) {
+                    if (!turn.empty() && !read_turn(turn, e)) read_ok = false;
+                } else {
+                    int64_t from = 0;
+                    for (const int64_t b : cut_at) {
+                        if (b <= from || b >= (int64_t) turn.size()) continue;
+                        std::vector<int64_t> seg(turn.begin() + (ptrdiff_t) from,
+                                                 turn.begin() + (ptrdiff_t) (b + 1));
+                        if (!read_turn(seg, e)) { read_ok = false; break; }
+                        save_check(turn[(size_t) b] == (int64_t) o.turn_token ? "turn" : "seam");
+                        from = b;
                     }
-                    if (cudaDeviceSynchronize() == cudaSuccess && checkpoint_save(partial, ss, g)) {
-                        partial.ids.assign(hist.begin(), hist.end());
-                        partial_p = p;
-                        partial_valid = true;
-                        seam_saved = true;
-                        std::fprintf(stderr,
-                                     "mntq repl:   -> seam checkpoint at pp=%lld (read %lld of %lld, open=%d)\n",
-                                     (long long) p, (long long) head.size(), (long long) turn.size(), req_open);
+                    if (read_ok && from < (int64_t) turn.size()) {
+                        std::vector<int64_t> seg(turn.begin() + (ptrdiff_t) from, turn.end());
+                        if (!read_turn(seg, e)) read_ok = false;
                     }
-                    if (!read_turn(tail, e)) {
-                        turn_failed(e);
-                        continue;
-                    }
-                } else if (!turn.empty() && !read_turn(turn, e)) {
+                }
+                if (!read_ok) {
                     turn_failed(e);
                     continue;
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
-                // PARTIAL REUSE (fallback): the whole prompt was read in one piece - keep the state as this turn's
-                // generation starts.  The seam path above already checkpointed one generation-prompt-width earlier,
-                // which is what a re-sent turn actually matches; this branch serves a request with no `open` key.
-                if (native_serve && stages.empty() && !seam_saved) {
-                    if (cudaDeviceSynchronize() == cudaSuccess && checkpoint_save(partial, ss, g)) {
-                        partial.ids.assign(hist.begin(), hist.end());
-                        partial_p = p;
-                        partial_valid = true;
-                    } else {
-                        std::fprintf(stderr, "mntq repl: partial checkpoint NOT saved\n");
-                    }
-                } else if (native_serve && !seam_saved) {
-                    std::fprintf(stderr, "mntq repl: partial checkpoint skipped (stages=%lld)\n",
-                                 (long long) stages.size());
-                }
+                // No turn token in this prompt: still keep one snapshot at the generation start so a request
+                // that drops that tail rewinds here rather than rereading the whole prompt.
+                if (native_serve && stages.empty() && checks.empty()) save_check("generation");
                 // The suffix drafter was seeded with the CLI's prompt and answer; a whole prompt here takes all of
                 // the turn's tokens, a delta skips its first one (the pending token, already in the drafter).
                 if (o.suffix_draft > 0)

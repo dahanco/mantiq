@@ -45,7 +45,17 @@ constexpr float EPS = 1e-6f;
 constexpr int64_t GEMM_SCRATCH_ELEMS = 32ll << 20;   // FP16 elements
 constexpr size_t GEMM_WS_BYTES = 32u << 20;
 constexpr size_t ALIGN = 256;
-constexpr int64_t kMaxPrefillChunk = 2048;
+// The same ceiling `Prefill` uses for `--prefill auto`: a logical prompt batch of up to 8192 tokens.  A run
+// starts at the requested chunk (or 8192 for auto) and halves it until the arena fits the free VRAM - as
+// llama.cpp's n_batch grows to its KV/workspace budget rather than stopping at a fixed ubatch.  Measured on
+// the 5311-token Qwopus prompt: 512 chunks ran 201.6 tok/s, 1024 257.3 and 2048 295.7, so stopping at 2048
+// left throughput on the table.
+constexpr int64_t kMaxPrefillChunk = 8192;
+constexpr int64_t kMinPrefillChunk = 256;
+// Room left outside the arena for what is allocated after it (cuBLAS state, the verify window, the commit
+// graph).  The driver reserves its own `--vram-reserve-mib` above this; here the check is against what is
+// actually free when the arena is carved, so an over-subscribed WDDM allocation cannot silently page.
+constexpr uint64_t kArenaHeadroomBytes = 256ull << 20;
 // The blobs a layer's routed experts are staged into when the source cannot hand the GPU a device address
 // over PCIe (`ExpertSource::device_alias`) - `kExpertRingSlots` of them at once, so a layer with more distinct
 // routed experts than this takes several grouped launches.  Bounded deliberately: the alternative is one
@@ -153,13 +163,13 @@ struct PinnedFloats {
 // The CPU results arrive as a COMPACT image -row `c` is the `c`-th entry a CPU expert computed, not the `c`-th
 // row of `parts`- because that is what makes their upload and the resident experts independent: the DMA writes
 // no row the grouped launch touches, so the two can run at once.  This puts every row back where the combine
-// reads it.  `blockIdx.y` is the entry, so the grid is capped at 65535 entries; a chunk's `T*top_k` is at most
-// 2048 * 15.
+// reads it.  A grid dimension is capped at 65535 entries, while an 8192-token chunk with top-8 routing
+// produces 65536 entries, so the y dimension strides over the rows rather than assuming one block per entry.
 __global__ void scatter_rows_kernel(float* __restrict__ dst, const int32_t* __restrict__ rows,
-                                    const float* __restrict__ src, int width) {
-    const int64_t r = blockIdx.y;
+                                    const float* __restrict__ src, int width, int n_rows) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < width) dst[(size_t) rows[r] * width + c] = src[(size_t) r * width + c];
+    for (int r = blockIdx.y; r < n_rows; r += gridDim.y)
+        if (c < width) dst[(size_t) rows[r] * width + c] = src[(size_t) r * width + c];
 }
 
 // ------------------------------------------------------------------ the chunk arena
@@ -785,8 +795,9 @@ struct Qwen35MoePrefill::Impl {
         }
         mark(false);
         if (has_cpu) {
-            const dim3 sm((unsigned) ((N + 255) / 256), (unsigned) cpu_n);
-            scatter_rows_kernel<<<sm, 256, 0, cs>>>(bufs.parts, bufs.cpu_dst, bufs.cpu_parts, (int) N);
+            const int rows = (int) cpu_n;
+            const dim3 sm((unsigned) ((N + 255) / 256), (unsigned) std::min<int>(rows, 65535));
+            scatter_rows_kernel<<<sm, 256, 0, cs>>>(bufs.parts, bufs.cpu_dst, bufs.cpu_parts, (int) N, rows);
         }
         // The local compact plan and the merge must outlive their asynchronous copies and the launch above.
         if (cudaStreamSynchronize(cs) != cudaSuccess) {
@@ -1094,11 +1105,8 @@ bool Qwen35MoePrefill::init(const core::WeightTable& wt, const core::ModelGeomet
     }
     if (chunk < 1) { err = "qwen35moe prefill: chunk must be positive"; return false; }
     if (ss.k < 1) { err = "qwen35moe prefill: the session's top-k is unset"; return false; }
-    if (chunk > kMaxPrefillChunk) {
-        std::fprintf(stderr, "mntq generate: qwen35moe prompt path: chunk %lld clamped to %lld\n",
-                     (long long) chunk, (long long) kMaxPrefillChunk);
-        chunk = kMaxPrefillChunk;
-    }
+    const int64_t requested_chunk = chunk;
+    chunk = std::min(chunk, kMaxPrefillChunk);
 
     auto m = std::make_unique<Impl>();
     m->wt = &wt;
@@ -1128,21 +1136,40 @@ bool Qwen35MoePrefill::init(const core::WeightTable& wt, const core::ModelGeomet
         }
     }
 
-    const uint64_t bytes = bytes_needed(g, ss, chunk);
-    if (cudaMalloc(&m->arena, bytes) != cudaSuccess) {
-        cudaGetLastError();
-        err = "qwen35moe prefill: the chunk arena (" + std::to_string(bytes >> 20) + " MiB) does not fit";
-        return false;
+    // llama.cpp grows n_batch to fit its KV/workspace budget; do the same here.  Under WDDM an oversubscribed
+    // cudaMalloc succeeds and then pages to system memory, so check the free VRAM as well as the allocation,
+    // and halve the chunk until both the arena and the carve fit beside the headroom for later allocations.
+    uint64_t bytes = 0;
+    for (;;) {
+        bytes = bytes_needed(g, ss, chunk);
+        size_t free_b = 0, total_b = 0;
+        const bool roomy = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+                           (uint64_t) free_b >= bytes + kArenaHeadroomBytes;
+        Alloc o;
+        if (roomy && cudaMalloc(&m->arena, bytes) == cudaSuccess) {
+            m->arena_bytes = (size_t) bytes;
+            o.cur = m->arena;
+            o.left = (size_t) bytes;
+            carve_chunk(chunk, g, ss.k, qsa_cap_for(ss), o, m->bufs);
+            if (o.ok) break;
+            cudaFree(m->arena);
+            m->arena = nullptr;
+            m->arena_bytes = 0;
+        } else {
+            cudaGetLastError();
+        }
+        if (chunk <= kMinPrefillChunk) {
+            err = "qwen35moe prefill: the chunk arena (" + std::to_string(bytes >> 20) +
+                  " MiB) does not fit the free VRAM";
+            return false;
+        }
+        chunk = std::max(kMinPrefillChunk, chunk / 2);
     }
-    m->arena_bytes = (size_t) bytes;
-    Alloc o;
-    o.cur = m->arena;
-    o.left = (size_t) bytes;
-    carve_chunk(chunk, g, ss.k, qsa_cap_for(ss), o, m->bufs);
-    if (!o.ok) {
-        err = "qwen35moe prefill: the chunk buffers do not fit the arena";
-        return false;
-    }
+    m->chunk = chunk;
+    if (chunk != requested_chunk)
+        std::fprintf(stderr, "mntq generate: qwen35moe prompt path: chunk %lld -> %lld tokens so its %llu MiB "
+                             "arena fits\n", (long long) requested_chunk, (long long) chunk,
+                     (unsigned long long) (bytes >> 20));
     if (!m->gemm.init_external(stream, m->bufs.gemm_scratch, GEMM_SCRATCH_ELEMS, m->bufs.gemm_ws, GEMM_WS_BYTES,
                                err))
         return false;
