@@ -26,6 +26,27 @@ void check(const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
 }
 
+// MNTQ_EXPDEC=1 (opt-in): the verify window's routed experts stage the group's q8_1 activations in shared memory,
+// so a decoded weight block is applied to the group's entries without 9 scattered 4-byte global loads each.  The
+// sum tree / lane / k order is the default kernel's, so the output is bitwise the same (only x's location changes).
+static bool expdec_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("MNTQ_EXPDEC");
+        const bool b = v != nullptr && v[0] == '1';
+        if (b) std::fprintf(stderr, "mntq expdec: gate/up shared-memory activation staging enabled (MNTQ_EXPDEC=1)\n");
+        return b;
+    }();
+    return on;
+}
+static int expdec_nc() {
+    static const int nc = [] {
+        const char* v = std::getenv("MNTQ_EXPDEC_NC");
+        const int n = v != nullptr ? std::atoi(v) : 4;
+        return n >= 1 && n <= 8 ? n : 4;
+    }();
+    return nc;
+}
+
 // ---------------------------------------------------------------- llama.cpp helpers (vecdotq.cuh)
 __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     const uint16_t* x16 = (const uint16_t*) x;
@@ -772,6 +793,114 @@ __global__ void __launch_bounds__(256) native_gu_role_kernel(const unsigned long
     }
 }
 
+// ---------------------------------------------------------------- MNTQ_EXPDEC: shared-memory activation staging
+//
+// row_dot_multi with a runtime entry count.  The k order, lane assignment and warp_sum are exactly row_dot's, and
+// F::dot reads the same q8_1 bytes and scale (from shared instead of global), so each column's sum is bitwise the
+// default kernel's.  Columns past `n` are neither staged nor computed.
+template<int TY, int NC>
+__device__ __forceinline__ void ed_row_dot_multi(const uint8_t* row, const block_q8_1* x, int xb, int nb, int lane,
+                                                 int n, float* s) {
+    using F = Fmt<TY>;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const block_q8_1* base = x + (size_t) kbx * (F::qk / 32);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) s[c] += F::dot(row, base + (size_t) c * xb, kbx, iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < n) s[c] = warp_sum(s[c]);
+}
+
+// Staging helper: copy `n` entries' q8_1 activation rows (each xb blocks of 36 bytes) into the dynamic shared
+// array `sx` as NC columns of xb blocks.  36 is divisible by 4, so both source and destination are int-aligned.
+template<int NC>
+__device__ __forceinline__ void ed_stage(int* __restrict__ sx, const block_q8_1* __restrict__ xq,
+                                         const int32_t* __restrict__ ent_tok, int eb, int n, int xb, int tid) {
+    const int words = xb * (int) (sizeof(block_q8_1) / sizeof(int));
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c >= n) break;
+        const int* src = (const int*) (xq + (size_t) ent_tok[eb + c] * xb);
+        int* dst = sx + (size_t) c * xb * (sizeof(block_q8_1) / sizeof(int));
+        for (int i = tid; i < words; i += 256) dst[i] = src[i];
+    }
+}
+
+template<int TG, int NC>
+__global__ void __launch_bounds__(256) expdec_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                        const int32_t* __restrict__ grp_start,
+                                                        const int32_t* __restrict__ n_groups,
+                                                        const int32_t* __restrict__ ent_tok,
+                                                        const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                        float* __restrict__ gate, float* __restrict__ up) {
+    extern __shared__ block_q8_1 sx[];                 // [NC][xb], one q8_1 row per staged entry
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;
+    const bool row_ok = row < 2 * (int) L.n_ff;
+    const bool is_up = row >= (int) L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = row_ok ? blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row : nullptr;
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int eb = e0; eb < e1; eb += NC) {
+        const int n = min(NC, e1 - eb);
+        ed_stage<NC>((int*) sx, xq, ent_tok, eb, n, xb, threadIdx.x);
+        __syncthreads();
+        if (row_ok) {
+            float s[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+            ed_row_dot_multi<TG, NC>(wr, (const block_q8_1*) sx, xb, nb, lane, n, s);
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < n; ++c) (is_up ? up : gate)[(size_t) (eb + c) * L.n_ff + r] = s[c];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template<int TY, int NC>
+__global__ void __launch_bounds__(256) expdec_gu_role_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_tok,
+                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                             int role, float* __restrict__ out) {
+    extern __shared__ block_q8_1 sx[];
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;
+    const bool row_ok = row < (int) L.n_ff;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = row_ok ? blob + (role ? L.up_off : 0) + (size_t) row * (role ? L.up_row : L.gu_row) : nullptr;
+    const int nb = (int) (L.n_embd / Fmt<TY>::qk), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int eb = e0; eb < e1; eb += NC) {
+        const int n = min(NC, e1 - eb);
+        ed_stage<NC>((int*) sx, xq, ent_tok, eb, n, xb, threadIdx.x);
+        __syncthreads();
+        if (row_ok) {
+            float s[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+            ed_row_dot_multi<TY, NC>(wr, (const block_q8_1*) sx, xb, nb, lane, n, s);
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < n; ++c) out[(size_t) (eb + c) * L.n_ff + row] = s[c];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       float limit, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1330,6 +1459,38 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
+// The MNTQ_EXPDEC switch, kept out of the type switch's macro so the default path stays a one-line launch.
+template<int TY>
+inline void ed_launch_gu(const NativeExpertLayout& L, const unsigned long long* gp, const int32_t* gs,
+                         const int32_t* gn, const int32_t* et, const block_q8_1* X, float* gate, float* up,
+                         bool ed, int ed_nc, size_t ed_unit, const dim3& grid, cudaStream_t s) {
+    if (!ed) {
+        native_gu_kernel<TY><<<grid, 256, 0, s>>>(gp, gs, gn, et, X, L, gate, up);
+        return;
+    }
+    switch (ed_nc) {
+        case 2: expdec_gu_kernel<TY, 2><<<grid, 256, 2 * ed_unit, s>>>(gp, gs, gn, et, X, L, gate, up); break;
+        case 4: expdec_gu_kernel<TY, 4><<<grid, 256, 4 * ed_unit, s>>>(gp, gs, gn, et, X, L, gate, up); break;
+        case 8: expdec_gu_kernel<TY, 8><<<grid, 256, 8 * ed_unit, s>>>(gp, gs, gn, et, X, L, gate, up); break;
+        default: expdec_gu_kernel<TY, 1><<<grid, 256, ed_unit, s>>>(gp, gs, gn, et, X, L, gate, up); break;
+    }
+}
+template<int TY>
+inline void ed_launch_role(const NativeExpertLayout& L, const unsigned long long* gp, const int32_t* gs,
+                           const int32_t* gn, const int32_t* et, const block_q8_1* X, int role, float* outp,
+                           bool ed, int ed_nc, size_t ed_unit, const dim3& grid, cudaStream_t s) {
+    if (!ed) {
+        native_gu_role_kernel<TY><<<grid, 256, 0, s>>>(gp, gs, gn, et, X, L, role, outp);
+        return;
+    }
+    switch (ed_nc) {
+        case 2: expdec_gu_role_kernel<TY, 2><<<grid, 256, 2 * ed_unit, s>>>(gp, gs, gn, et, X, L, role, outp); break;
+        case 4: expdec_gu_role_kernel<TY, 4><<<grid, 256, 4 * ed_unit, s>>>(gp, gs, gn, et, X, L, role, outp); break;
+        case 8: expdec_gu_role_kernel<TY, 8><<<grid, 256, 8 * ed_unit, s>>>(gp, gs, gn, et, X, L, role, outp); break;
+        default: expdec_gu_role_kernel<TY, 1><<<grid, 256, ed_unit, s>>>(gp, gs, gn, et, X, L, role, outp); break;
+    }
+}
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -1343,12 +1504,19 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+    // MNTQ_EXPDEC: one q8_1 activation row is xb blocks of 36 bytes.  Cap the staged batch so the dynamic shared
+    // request stays under 40 KB (48 KB is the default per-block limit on the cards this engine targets).
+    const bool ed = expdec_on();
+    const int xb = (int) (L.n_embd / 32);
+    const size_t ed_unit = (size_t) xb * sizeof(block_q8_1);
+    int ed_nc = expdec_nc();
+    while (ed_nc > 1 && (size_t) ed_nc * ed_unit > 40000) ed_nc >>= 1;
     // one shared type: the combined kernel computes both roles in one launch.  A mixed-quant layer (gate_type !=
     // up_type) launches the per-role kernel twice, each role with its own type and row stride.
 #define GU_CASE(TY) \
-    case TY: native_gu_kernel<TY><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break
+    case TY: ed_launch_gu<TY>(L, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, ed, ed_nc, ed_unit, ggu, s); break
 #define GU_ROLE_CASE(TY) \
-    case TY: native_gu_role_kernel<TY><<<ggr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, role, outp); break
+    case TY: ed_launch_role<TY>(L, grp_ptr, grp_start, n_groups, ent_tok, X, role, outp, ed, ed_nc, ed_unit, ggr, s); break
     if (L.gu_type == L.up_type) {
         switch (L.gu_type) {
             GU_CASE(1); GU_CASE(2); GU_CASE(16); GU_CASE(17); GU_CASE(18); GU_CASE(21); GU_CASE(22); GU_CASE(23); GU_CASE(29);

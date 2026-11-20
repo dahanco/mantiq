@@ -289,6 +289,31 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     return true;
 }
 
+bool PleTable::gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const {
+    // MNTQ_PLE_COMPACT: the mapped table's raw IQ4_NL rows.  Direct mode has no mapping (impl_->data is null),
+    // so it cannot take this path - the caller falls back to gather_batch's SSD read.  The table is IQ4_NL by
+    // contract (open checks the tensor type), and a row is exactly PLE_ROW_BYTES.
+    if (impl_->mode == PleIo::Direct || impl_->data == nullptr) return false;
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t* o = out + i * PLE_ROW_BYTES;
+        if (rows[i] >= impl_->n_rows) {
+            // A row past the table decodes to +0.0f (read_row / iq4nl_dequant_row write the same): scale 0 and
+            // code 8 (value +1) in every nibble.  All-zero bytes would decode to -0.0f (scale 0 times code 0's
+            // -127) on the device, which is not bitwise equal.
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+                uint8_t* blk = o + (size_t) b * 18;
+                std::memset(blk, 0, 2);
+                std::memset(blk + 2, 0x88, 16);
+            }
+        } else {
+            std::memcpy(o, impl_->data + (size_t) rows[i] * PLE_ROW_BYTES, PLE_ROW_BYTES);
+        }
+    }
+    impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+    return true;
+}
+
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
 
 std::string PleTable::io_report() const {

@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -63,6 +64,22 @@ namespace strata::prefill {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// MNTQ_PLE_COMPACT=1 (opt-in): a prompt chunk's PLE rows go up as raw IQ4_NL bytes (90 B a row) and are
+// dequantized on the device, instead of dequantizing on the host and uploading 10,240 floats a token.  The
+// output floats are bitwise the same; roughly 7x less PCIe traffic.  Requires the PLE table in memory
+// (--ple-io ram/mmap, the default); the Direct SSD mode falls back to gather_batch.
+static bool ple_compact_on() {
+    static const bool on = [] { const char* v = std::getenv("MNTQ_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// MNTQ_PLE_COPY_STREAM=1 (opt-in, with COMPACT): upload those raw rows on a stream of their own so the DMA
+// overlaps layer 0 instead of idling the compute stream.  The bytes and the dequant kernel are unchanged.
+static bool ple_copy_stream_on() {
+    static const bool on = [] { const char* v = std::getenv("MNTQ_PLE_COPY_STREAM"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 constexpr float EPS = 1e-6f;
 constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
@@ -315,6 +332,10 @@ struct Prefill::Impl {
     float* ple_emb_host[2] = {};             // pinned, double-buffered: the next chunk's rows are read while this
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
+    bool ple_compact[2] = {false, false};    // MNTQ_PLE_COMPACT: the pinned buffer holds raw IQ4_NL rows
+    uint8_t* ple_raw_dev = nullptr;          // their device copy (T * 16 rows of 90 bytes)
+    cudaStream_t ple_copy = nullptr;         // MNTQ_PLE_COPY_STREAM: the raw rows' upload stream
+    cudaEvent_t ple_raw_free = nullptr;      // cs has dequantized ple_raw_dev: the next upload may overwrite it
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -379,6 +400,7 @@ Prefill::~Prefill() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
+    if (impl_->ple_copy) (void) cudaStreamSynchronize(impl_->ple_copy);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -388,6 +410,9 @@ Prefill::~Prefill() {
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
+    if (impl_->ple_raw_dev) cudaFree(impl_->ple_raw_dev);
+    if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
+    if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (void* p : impl_->owned) cudaFree(p);
@@ -588,6 +613,22 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+        if (ple_compact_on() && m.ple_raw_dev == nullptr &&
+            cudaMalloc((void**) &m.ple_raw_dev,
+                       (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES) != cudaSuccess) {
+            m.ple_raw_dev = nullptr;
+            (void) cudaGetLastError();
+        }
+    }
+    // MNTQ_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs
+    // and wait on their release, so waiting on it could idle the compute stream longer than the DMA itself.
+    if (ple_copy_stream_on() && m.ple_raw_dev != nullptr &&
+        ((!m.ple_copy && cudaStreamCreateWithFlags(&m.ple_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+         (!m.ple_raw_free && cudaEventCreateWithFlags(&m.ple_raw_free, cudaEventDisableTiming) != cudaSuccess))) {
+        if (m.ple_copy) { (void) cudaStreamDestroy(m.ple_copy); m.ple_copy = nullptr; }
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "mntq prefill: MNTQ_PLE_COPY_STREAM=1: the upload stream could not be created; "
+                             "the PLE rows go up on the compute stream\n");
     }
     if (ss.qsa_states[0].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[0].n_pages;
@@ -1016,6 +1057,12 @@ bool Prefill::drain_pipe(std::string& err) {
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     Impl& m = *impl_;
+    // MNTQ_PLE_COPY_STREAM: drain the side stream on every exit (including an early error), before a later run
+    // refills the single raw staging buffer.  Empty-stream syncs are cheap when the flag is off.
+    struct PleCopyDrain {
+        cudaStream_t s;
+        ~PleCopyDrain() { if (s) (void) cudaStreamSynchronize(s); }
+    } ple_copy_drain{m.ple_copy};
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
@@ -1077,6 +1124,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             pv[0] = pv[1];
             pv[1] = tok;
         }
+        // MNTQ_PLE_COMPACT: raw IQ4_NL bytes into the same pinned buffer (only the first 1,440 bytes a token),
+        // dequantized on the device by ple_land.  Falls back to the host gather on any prerequisite failure.
+        if (ple_compact_on() && m.ple_pageable[buf].empty() && m.ple_raw_dev != nullptr &&
+            ss.ple.table->gather_raw_iq4nl(m.ple_rows[buf].data(), (size_t) T, (uint8_t*) m.ple_emb_host[buf])) {
+            m.ple_compact[buf] = true;
+            return true;
+        }
+        m.ple_compact[buf] = false;
         return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
     };
     std::string ple_next_err;
@@ -1153,8 +1208,31 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = ple_next_err;
                 return false;
             }
-            cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
-            cudaEventRecord(m.ple_copied[ple_buf], m.cs);
+            // MNTQ_PLE_COMPACT + MNTQ_PLE_COPY_STREAM: the raw rows go up on their own stream once the previous
+            // chunk's dequant has released the single raw staging buffer; the compute stream waits only at the
+            // dequant.  Without either flag this is the original float upload on m.cs, bitwise unchanged.
+            const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
+            const bool ple_side = m.ple_compact[ple_buf] && m.ple_copy != nullptr;
+            const cudaStream_t ple_up = ple_side ? m.ple_copy : m.cs;
+            bool upl = !ple_side || cudaStreamWaitEvent(m.ple_copy, m.ple_raw_free, 0) == cudaSuccess;
+            if (upl) {
+                if (m.ple_compact[ple_buf])
+                    upl = cudaMemcpyAsync(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, cudaMemcpyHostToDevice,
+                                          ple_up) == cudaSuccess;
+                else
+                    upl = cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4,
+                                          cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+            }
+            if (upl) upl = cudaEventRecord(m.ple_copied[ple_buf], ple_up) == cudaSuccess;
+            if (upl && ple_side) upl = cudaStreamWaitEvent(m.cs, m.ple_copied[ple_buf], 0) == cudaSuccess;
+            if (upl && m.ple_compact[ple_buf]) {
+                strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                if (ple_side) upl = cudaEventRecord(m.ple_raw_free, m.cs) == cudaSuccess;
+            }
+            if (!upl) {
+                err = std::string("mntq prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
             if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {

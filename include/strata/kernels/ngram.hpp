@@ -132,6 +132,10 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// MNTQ_PLE_COMPACT: the same rows as their raw IQ4_NL bytes (n_tokens x 16 rows of PLE_ROW_BYTES each),
+    /// for ple_iq4nl_dequant on the device.  False (nothing written) unless the table is in memory (Mmap/RAM)
+    /// and IQ4_NL; the out-of-table rows encode +0.0f so the device dequant matches gather_batch bitwise.
+    bool gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

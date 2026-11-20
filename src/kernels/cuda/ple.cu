@@ -22,6 +22,7 @@
 #include "strata/kernels/native_ple_postops.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdio>
@@ -361,6 +362,29 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // **NO `cudaStreamSynchronize` HERE.**  It was there to make the function self-contained for the parity
     // test, and inside a capture it is an error - a caller that wants the result immediately synchronises
     // itself, and the engine's caller does not want that at all.
+}
+
+// ---------------------------------------------------------------- MNTQ_PLE_COMPACT
+namespace {
+__constant__ int8_t kPleIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+// One thread a value: row r, block b (18 bytes: fp16 d, 16 bytes of codes), element j of 32 (j < 16: low nibble
+// of qs[j], else the high nibble of qs[j - 16] - the split halves of iq4nl_dequant_row).
+__global__ void ple_iq4nl_dequant_kernel(const uint8_t* __restrict__ raw, int64_t n, float* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t r = i / PLE_HEAD_DIM;
+    const int e = (int) (i - r * PLE_HEAD_DIM), b = e >> 5, j = e & 31;
+    const uint8_t* blk = raw + (size_t) r * PLE_ROW_BYTES + (size_t) b * 18;
+    const float d = __half2float(__ushort_as_half((unsigned short) (blk[0] | (blk[1] << 8))));
+    const uint8_t q = blk[2 + (j & 15)];
+    out[i] = d * (float) kPleIq4Nl[j < 16 ? (q & 15) : (q >> 4)];
+}
+}  // namespace
+
+void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream) {
+    const int64_t n = rows * PLE_HEAD_DIM;
+    if (n <= 0) return;
+    ple_iq4nl_dequant_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(raw, n, out);
 }
 
 }  // namespace strata::kernels
