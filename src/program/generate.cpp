@@ -9454,6 +9454,15 @@ int main(int argc, char** argv) {
             // request, so this is the record its prefix is matched against; `--repl` only ever needs the tail.
             std::vector<int64_t> hist;
             bool fresh = false;
+            // PARTIAL REUSE.  The running state as it stands at a turn's generation start, where a reasoning
+            // model's `<think>` block is the first thing to grow from.  The client re-sends that turn WITHOUT the
+            // block, so the next request's tokens break off exactly here though every position before it is
+            // unchanged - the divergence branch below restores this and reads only the request's own tail.  Only
+            // the GDN recurrence and the QSA tail need saving: the attention K/V under the rewind point is left
+            // alone and the cells above it are overwritten by the tail's own read.
+            ConvCheckpoint partial;
+            int64_t partial_p = 0;
+            bool partial_valid = false;
             // The reader thread's own flag (set up below): a STOP has to reach a request that is still running.
             std::atomic<bool> stop_req{false};
             // A NEW CONVERSATION ON THE SAME RESIDENCY (`RESET`, the page's New chat; also a `--serve` request
@@ -9475,6 +9484,7 @@ int main(int argc, char** argv) {
                 if (cudaDeviceSynchronize() != cudaSuccess) return false;
                 ver.reset();
                 hist.clear();
+                partial_valid = false;   // the sequence it was taken from no longer exists
                 p = 0;
                 x = 0;
                 fresh = true;
@@ -9709,6 +9719,7 @@ int main(int argc, char** argv) {
                 float req_temperature = 0.0f, req_top_p = 1.0f, req_min_p = 0.0f;
                 int req_top_k = 20;
                 unsigned long long req_seed = 0;
+                int req_open = 0;   // `open=<n>`: tokens the template's generation prompt wrote at the prompt's end
                 bool have_keys = false;
                 for (;;) {
                     while (endp != nullptr && *endp == ' ') ++endp;
@@ -9729,6 +9740,7 @@ int main(int argc, char** argv) {
                     else if (key == "min_p") req_min_p = std::strtof(val, nullptr);
                     else if (key == "top_k") req_top_k = std::atoi(val);
                     else if (key == "seed") req_seed = std::strtoull(val, nullptr, 10);
+                    else if (key == "open") req_open = std::atoi(val);
                     // a key this engine does not implement (penalties, the thinking budget, the tuning keys) is
                     // skipped, exactly as the artifact's serve does
                 }
@@ -9762,21 +9774,48 @@ int main(int argc, char** argv) {
                     // `hist.size()` is the state's own pending token - the last thing it emitted - when the request
                     // is this conversation's continuation.  `reused` is what the resident state already holds.
                     size_t L = 0;
-                    if (!whole_prompt) {
-                        while (L < hist.size() && L < ids.size() && hist[L] == ids[L]) ++L;
-                        if (L != hist.size() || L >= ids.size() || ids[L] != (int64_t) x) whole_prompt = true;
-                    }
+                    while (L < hist.size() && L < ids.size() && hist[L] == ids[L]) ++L;
+                    if (!whole_prompt &&
+                        (L != hist.size() || L >= ids.size() || ids[L] != (int64_t) x)) whole_prompt = true;
                     if (whole_prompt) {   // not a continuation of this state: the sequence starts over, prompt whole
-                        if (!fresh && !ctx_reset()) {
-                            turn_failed("the context reset failed");
-                            continue;
+                        // PARTIAL REUSE.  `ids` is not a continuation of `hist`, but it can still share a prefix
+                        // with the state we checkpointed at the last turn's generation start (PARTIAL, below): a
+                        // reasoning model emits a <think> block and KEEPS it in the sequence, while the client
+                        // re-sends that same turn WITHOUT the block - so the match breaks at the block's first
+                        // token while every position before it is unchanged.  Reading the whole conversation again
+                        // for that would discard the very cache this path exists for, so when the checkpoint covers
+                        // the divergence, rewind to it and read only the tail.  `L` is the common prefix; the
+                        // checkpoint is a prefix of it, and `ids[partial_p]` is the token that was pending then
+                        // (the checkpoint's own `x`) - exactly what the delta branch below hands `read_turn`.
+                        if (!fresh && partial_valid && (int64_t) L >= partial_p && !ids.empty()) {
+                            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_restore(partial, ss, g)) {
+                                turn_failed("the context restore failed");
+                                continue;
+                            }
+                            hist.resize((size_t) partial_p);
+                            p = partial_p;
+                            x = 0;   // read_turn sets it from the turn's own last token
+                            reused = partial_p;
+                            turn.assign(ids.begin() + (ptrdiff_t) partial_p, ids.end());
+                            whole_prompt = false;
+                            partial_valid = false;   // taken again at this turn's generation start
+                            std::fprintf(stderr, "mntq repl:   -> partial restore at pp=%lld, tail %lld tokens\n",
+                                         (long long) partial_p, (long long) turn.size());
+                        } else {
+                            if (!fresh && !ctx_reset()) {
+                                turn_failed("the context reset failed");
+                                continue;
+                            }
+                            turn = ids;
+                            std::fprintf(stderr, "mntq repl:   -> ctx_reset, prompt %lld tokens\n",
+                                         (long long) ids.size());
                         }
-                        turn = ids;
                     } else {
                         reused = (int64_t) L;
                         turn.reserve(ids.size() - L);
                         turn.push_back((int64_t) x);   // the pending token is read back, then what follows it
                         turn.insert(turn.end(), ids.begin() + (ptrdiff_t) (L + 1), ids.end());
+                        std::fprintf(stderr, "mntq repl:   -> delta reuse %lld\n", (long long) L);
                     }
                 } else if (whole_prompt) {
                     turn = ids;
@@ -9792,11 +9831,56 @@ int main(int argc, char** argv) {
                 }
                 std::string e;
                 const Clock::time_point read_t0 = Clock::now();
-                if (!turn.empty() && !read_turn(turn, e)) {
+                // PARTIAL REUSE, in the shape of llama.cpp's prompt cache.  The template's generation prompt wrote
+                // `req_open` tokens at the END of this prompt (the assistant header and, for a reasoning model, its
+                // opening `<think>`); the client re-sends the conversation next turn but NOT those tokens, so its
+                // prompt breaks off exactly there.  So the read is split at that seam and the state is checkpointed
+                // between the halves - the next request rewinds to it and reads only its own tail instead of the whole
+                // conversation.  (A GDN recurrence cannot be truncated the way K/V can, so the snapshot is what a
+                // rewind needs; without the split the checkpoint sat past the break and never matched.)
+                partial_valid = false;
+                bool seam_saved = false;
+                if (native_serve && stages.empty() && req_open > 0 && (int64_t) turn.size() > req_open + 1) {
+                    const int64_t cut = (int64_t) turn.size() - req_open + 1;   // read through the seam's own position
+                    std::vector<int64_t> head(turn.begin(), turn.begin() + (ptrdiff_t) cut);
+                    std::vector<int64_t> tail(turn.begin() + (ptrdiff_t) (cut - 1), turn.end());
+                    if (!read_turn(head, e)) {
+                        turn_failed(e);
+                        continue;
+                    }
+                    if (cudaDeviceSynchronize() == cudaSuccess && checkpoint_save(partial, ss, g)) {
+                        partial.ids.assign(hist.begin(), hist.end());
+                        partial_p = p;
+                        partial_valid = true;
+                        seam_saved = true;
+                        std::fprintf(stderr,
+                                     "mntq repl:   -> seam checkpoint at pp=%lld (read %lld of %lld, open=%d)\n",
+                                     (long long) p, (long long) head.size(), (long long) turn.size(), req_open);
+                    }
+                    if (!read_turn(tail, e)) {
+                        turn_failed(e);
+                        continue;
+                    }
+                } else if (!turn.empty() && !read_turn(turn, e)) {
                     turn_failed(e);
                     continue;
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
+                // PARTIAL REUSE (fallback): the whole prompt was read in one piece - keep the state as this turn's
+                // generation starts.  The seam path above already checkpointed one generation-prompt-width earlier,
+                // which is what a re-sent turn actually matches; this branch serves a request with no `open` key.
+                if (native_serve && stages.empty() && !seam_saved) {
+                    if (cudaDeviceSynchronize() == cudaSuccess && checkpoint_save(partial, ss, g)) {
+                        partial.ids.assign(hist.begin(), hist.end());
+                        partial_p = p;
+                        partial_valid = true;
+                    } else {
+                        std::fprintf(stderr, "mntq repl: partial checkpoint NOT saved\n");
+                    }
+                } else if (native_serve && !seam_saved) {
+                    std::fprintf(stderr, "mntq repl: partial checkpoint skipped (stages=%lld)\n",
+                                 (long long) stages.size());
+                }
                 // The suffix drafter was seeded with the CLI's prompt and answer; a whole prompt here takes all of
                 // the turn's tokens, a delta skips its first one (the pending token, already in the drafter).
                 if (o.suffix_draft > 0)
@@ -9898,8 +9982,11 @@ int main(int argc, char** argv) {
                     }
                 }
                 const double turn_ms = std::chrono::duration<double, std::milli>(Clock::now() - turn_t0).count();
-                std::fprintf(stderr, "mntq repl: turn answered %lld tokens in %.1f ms (%.1f tok/s)\n",
-                             (long long) n_out, turn_ms, turn_ms > 0 ? 1000.0 * (double) n_out / turn_ms : 0.0);
+                std::fprintf(stderr,
+                             "mntq repl: turn answered %lld tokens in %.1f ms (%.1f tok/s), prompt %.1f ms, "
+                             "reused %lld\n",
+                             (long long) n_out, turn_ms, turn_ms > 0 ? 1000.0 * (double) n_out / turn_ms : 0.0,
+                             prompt_ms, (long long) reused);
                 // STRATA_DECODE_TIMING=1: where a serve/repl turn's decode time goes (one line per turn)
                 static const bool dec_timing_srv = std::getenv("STRATA_DECODE_TIMING") != nullptr;
                 if (dec_timing_srv && turn_rounds > 0) {

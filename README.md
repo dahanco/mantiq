@@ -17,7 +17,7 @@ Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMa
 Tokens per second, decoding only, on one file: `Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf` (Qwen 35B-A3B MoE, Q4_K_M),
 RTX 3070 8 GB, i7-12700K, 32 GB RAM, Windows. Mantiq ran its CUDA path; the llama.cpp build at hand is Vulkan-only (no
 `ggml-cuda.dll`), and `-ncmoe 32` was the best of a 28-38 sweep because 20.2 GiB of weights do not fit in 8 GB of VRAM.
-Reading the prompt is the other half of the story, and there llama.cpp wins: it is about 2.4x faster at prefill, since
+Reading the prompt is the other half of the story, and there llama.cpp wins: it is about 1.2x faster at prefill, since
 the Qwen MoE path ships with `--prefill 0`. Generating the answer - what a person waiting at the keyboard sees - is
 where the gap goes the other way.
 

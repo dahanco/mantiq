@@ -1262,6 +1262,16 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    @staticmethod
+    def open_key(sampling: dict) -> str:
+        """`open=<n>`: how many tokens at the END of the prompt the template's generation prompt wrote (Service.prepare
+        computes it).  The client re-sends the conversation next turn but not those tokens, so its prompt breaks off
+        exactly `n` tokens before the end; the engine checkpoints its state there and the next request rewinds to that
+        seam and reads only its own tail - the reuse llama.cpp's prompt cache gets, for a state (a GDN recurrence)
+        that cannot be truncated.  "" when the request has none (a template that writes nothing there)."""
+        n = sampling.get("_open")
+        return f" open={int(n)}" if isinstance(n, int) and not isinstance(n, bool) and n > 0 else ""
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -1272,8 +1282,8 @@ class StrataEngine:
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})}{self.open_key(sampling or {})} {embeddings}" \
+            if embeddings else f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}{self.open_key(sampling or {})}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -1462,7 +1472,7 @@ class StrataEngine:
         self._tls.rid = rid
         self.progress = None
         self.prefill_tok_s_mean = None
-        keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
+        keys = self.sampling_keys(sampling or {}) + self.open_key(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
         try:
@@ -2211,6 +2221,22 @@ class Service:
             return self.tok.encode(prompt + suffix, parse_special=True)
         prompt, plain = unmark_literals(prompt, self.literals)
         return self.tok.encode(prompt + suffix, parse_special=True, plain=plain)
+
+    def generation_open(self, ids, messages, tools, kwargs) -> int:
+        """How many tokens at the END of `ids` the template's generation prompt wrote (add_generation_prompt): the
+        assistant turn's header and, for a reasoning model, its opening `<think>`.  The client re-sends the
+        conversation next turn but NOT those tokens, so its prompt breaks off exactly that many tokens before the end -
+        the seam the engine checkpoints its state at (`open=<n>` in GEN; a GDN recurrence cannot be truncated, so this
+        is how its prompt cache reuses work the way llama.cpp's does).  0 when the template writes nothing there, the
+        two renderings do not share the prefix that makes the seam exact, or the request carries a forced prefill (the
+        engine then keeps its whole-prompt behaviour)."""
+        try:
+            ids0 = self.render_ids(messages, tools, {**kwargs, "add_generation_prompt": False})
+        except Exception:  # noqa: BLE001 - a template that cannot render without it: no seam
+            return 0
+        if not ids0 or len(ids0) >= len(ids) or ids[:len(ids0)] != ids0:
+            return 0
+        return len(ids) - len(ids0)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -3198,6 +3224,9 @@ class Service:
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         ids = self.render_ids(messages, tools, kwargs, prefill)
+        # the seam the engine's partial reuse checkpoints at (`open` in the GEN line): 0 with a forced prefill, whose
+        # text the client will not re-send identically - the engine keeps its whole-prompt behaviour then
+        given["_open"] = 0 if prefill else self.generation_open(ids, messages, tools, kwargs)
         self.embeddings.path = None
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -4379,6 +4408,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
         sampling["_blocked"] = kw.get("_blocked")
         sampling["_think_resume"] = kw.get("_think_resume")
+        sampling["_open"] = kw.get("_open")
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -5105,7 +5135,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
                 oreq = {**oreq, "_prefill": kw["_prefill"]}
-            oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+            oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
+                    "_open": kw.get("_open")}
             cancel = threading.Event()
             watch_client(self, cancel)
             chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
@@ -5919,6 +5950,7 @@ def make_handler(svc: Service):
                     sampling["_prefill"] = kw["_prefill"]
                 sampling["_blocked"] = kw.get("_blocked")
                 sampling["_think_resume"] = kw.get("_think_resume")
+                sampling["_open"] = kw.get("_open")
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -5954,6 +5986,7 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
+            req = {**req, "_open": kw.get("_open")}             # the partial-reuse seam (Service.generation_open)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -6049,6 +6082,7 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
+            req = {**req, "_open": kw.get("_open")}             # the partial-reuse seam (Service.generation_open)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
