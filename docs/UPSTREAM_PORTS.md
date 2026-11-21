@@ -1,8 +1,8 @@
-# Upstream Strata ports (Mantiq 1.7.6 work tree)
+# Upstream Strata ports (Mantiq 1.7.7 work tree)
 
 Three ports from upstream Strata `3142b66b` are present in this work tree. Guarded suffix-lookup windows are
 promoted to the default on one-GPU CUDA; PLE compact/copy-stream and EXPDEC remain opt-in and off by default.
-The released `v1.7.6` binaries contain the promoted lookup window and the EXPDEC/PLE code behind their flags.
+The released `v1.7.7` binaries contain the promoted lookup window and the EXPDEC/PLE code behind their flags.
 The promoted CUDA build is `build-cuda`
 (CUDA 13.4, `sm_75;80;86;89`, `STRATA_NATIVE_EXPERTS=ON`, `STRATA_PORTABLE=ON`).
 
@@ -82,6 +82,6 @@ Baseline: `C:\tmp3\baseline-v175-expdec-mntq.exe`, SHA-256 `EBDE9940A3315B74F107
 Tested guarded variant: SHA-256 `7403DF95930CA329A74EDF96CF476A103C1F4F7823B5A0C35BFE47F0B9035ABF`
 (historical A/B artifact; not retained in the tree).
 Promoted binary: `C:\tmp3\project-mantiq\build-cuda\Release\mntq.exe`, SHA-256
-`81939C2CBF4B0AD83D9BB4A040ED1C506DD189FAC60BD795994866E5D1D6BA27`.
+`414D2A29201E6BAA84CA0B23E06078D3DAEF8B5DF64A1067373A865E6B42728B`.
 
 Raw logs: `C:\tmp3\_mntq_bench\lookup_ab_code3.log`, `lookup_ab_control2.log`; harness `C:\tmp3\lookup_ab.ps1`.
