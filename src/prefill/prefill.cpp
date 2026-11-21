@@ -626,6 +626,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         ((!m.ple_copy && cudaStreamCreateWithFlags(&m.ple_copy, cudaStreamNonBlocking) != cudaSuccess) ||
          (!m.ple_raw_free && cudaEventCreateWithFlags(&m.ple_raw_free, cudaEventDisableTiming) != cudaSuccess))) {
         if (m.ple_copy) { (void) cudaStreamDestroy(m.ple_copy); m.ple_copy = nullptr; }
+        m.ple_raw_free = nullptr;   // a failed cudaEventCreate leaves the output indeterminate on some drivers
         (void) cudaGetLastError();
         std::fprintf(stderr, "mntq prefill: MNTQ_PLE_COPY_STREAM=1: the upload stream could not be created; "
                              "the PLE rows go up on the compute stream\n");

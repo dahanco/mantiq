@@ -139,22 +139,25 @@ The setup asks which model you want, downloads it, builds everything once, **sta
 at `http://127.0.0.1:7711`. Windows: `START-MNTQ.bat` instead of `./setup.sh`. Every option (GPUs, context, an existing
 model folder, remote access, ...) is a question the setup asks; Enter takes the recommended answer.
 
-**Requirements in short:** an NVIDIA GPU of compute capability 7.0 or newer (one, or several that share the model),
-32 GB of RAM, and **a fast NVMe SSD** with room for the model. AMD (ROCm) and Windows are supported experimentally,
-and Apple Silicon through Metal for GLM-5.3-Flash. The setup checks all of it and prints the exact command for anything
-missing; it installs nothing system-wide.
+**Requirements in short:** an NVIDIA GPU of compute capability 7.0 or newer for a build from source (compute
+capability 6.0 is experimental), 32 GB of RAM, and **a fast NVMe SSD** with room for the model. The prebuilt CUDA
+package targets compute capability 7.5+ and needs an NVIDIA driver that supports CUDA 13. AMD (ROCm) and Windows are
+supported experimentally, and Apple Silicon through Metal for GLM-5.3-Flash. The setup checks all of it and prints the
+exact command for anything missing; it installs nothing system-wide.
 
 ### Prebuilt packages (Windows, nothing to build)
 
-Three ready-to-run packages are published with every [release](https://github.com/dahanco/mantiq/releases/latest). Unzip
+Two ready-to-run packages are published with every [release](https://github.com/dahanco/mantiq/releases/latest). Unzip
 one, double-click `START-MNTQ.bat`, and the first start asks for the model and downloads it - no compiler, no CUDA
 toolkit, no Python to install, and nothing is put on `PATH`:
 
 | Package | Runs on | Inside |
 | --- | --- | --- |
-| `Mantiq-Portable-CUDA.zip` (about 590 MB) | an NVIDIA PC | the compiled engine (`build\mntq.exe`) with its CUDA libraries, Mantiq's Python and its packages, and the stamped sources the engine was built from |
-| `Mantiq-Portable-CPU.zip` (about 45 MB) | any 64-bit PC, no GPU needed | the same dashboard on `ggml`'s CPU engine (`build-cpu\mntq-cpu.exe`) and the same Python |
-| `Mantiq-Portable-Vulkan.zip` (about 60 MB) | a PC whose GPU has no CUDA and no HIP (the GPU's own driver is enough) | the same dashboard on `ggml`'s Vulkan engine (`build-vulkan\mntq-vulkan.exe`) and the same Python |
+| `Mantiq-Portable-CUDA.zip` (about 600 MB) | an NVIDIA PC with compute capability 7.5+ and a CUDA 13-capable driver | the compiled engine (`build\mntq.exe`) with its CUDA libraries, Mantiq's Python and its packages, and the stamped sources the engine was built from |
+| `Mantiq-Portable-CPU.zip` (about 45 MB) | any 64-bit PC with AVX2, no GPU needed | the same dashboard on `ggml`'s CPU engine (`build-cpu\mntq-cpu.exe`) and the same Python |
+
+A Vulkan package also exists, but it is experimental and has not been refreshed with every release (the current one is
+1.6.2). It is not part of the 1.7.6 release assets.
 
 None of them carries a model: nothing is downloaded until the start asks, and a GGUF you already have can be added
 instead (below).

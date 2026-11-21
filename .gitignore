@@ -22,6 +22,9 @@ __pycache__/
 *.sqlite
 *.npz
 *.occ1
+*.prof
+/hermes-*.bin
+/hermes-*.prof
 td.log
 
 # created by setup.py on the user's machine

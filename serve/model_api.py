@@ -28,7 +28,12 @@ def parse_keep_alive(v):
         if re.fullmatch(r"-?\d+(\.\d+)?", s):
             return parse_keep_alive(float(s))
         if s.startswith("-"):
-            return FOREVER
+            rest = s[1:]
+            if re.fullmatch(r"\d+(\.\d+)?", rest):
+                return FOREVER
+            neg_parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)", rest)
+            if neg_parts and "".join(a + u for a, u in neg_parts) == rest:
+                return FOREVER
         parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)", s)
         if parts and "".join(a + u for a, u in parts) == s:
             return float(sum(float(a) * _UNITS[u] for a, u in parts))

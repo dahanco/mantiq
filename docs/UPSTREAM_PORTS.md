@@ -3,7 +3,7 @@
 Three ports from upstream Strata `3142b66b` are present in this work tree. Guarded suffix-lookup windows are
 promoted to the default on one-GPU CUDA; PLE compact/copy-stream and EXPDEC remain opt-in and off by default.
 The released `v1.7.6` binaries contain the promoted lookup window and the EXPDEC/PLE code behind their flags.
-The promoted CUDA build is `build-ab`
+The promoted CUDA build is `build-cuda`
 (CUDA 13.4, `sm_75;80;86;89`, `STRATA_NATIVE_EXPERTS=ON`, `STRATA_PORTABLE=ON`).
 
 ## PLE compact read-ahead — `MNTQ_PLE_COMPACT`, `MNTQ_PLE_COPY_STREAM`
@@ -25,8 +25,9 @@ The promoted CUDA build is `build-ab`
 ## EXPDEC shared-memory staging — `MNTQ_EXPDEC`, `MNTQ_EXPDEC_NC`
 
 * `expdec_gu_kernel` / `expdec_gu_role_kernel` stage `NC` entries' q8_1 activations into dynamic shared memory,
-  then apply each decoded weight block to all `NC` entries. `MNTQ_EXPDEC_NC` selects 1..8 (default 4; capped by
-  a 40 KB shared-memory budget). The down projection stays on the default path.
+  then apply each decoded weight block to all `NC` entries. `MNTQ_EXPDEC_NC` accepts 1..8; only 1, 2, 4 and 8 have
+  kernels, so other values snap down to the next supported width (3->2, 5/6/7->4; default 4). The down projection
+  stays on the default path.
 * The k/lane order and `warp_sum` tree are unchanged from `native_gu_kernel`, so each column's sum is bitwise
   identical. A/B runs compare the `output :` line hash; all arms matched.
 * Status: compiles and links; verified with B-A-B runs via `C:\tmp3\ab_flags.ps1`.
@@ -78,8 +79,9 @@ baseline arms (`A4A431D54B4238DD`, `3CC1D0E806B35BE9`), so a single mismatch the
 The control took only 5 lookup windows with narrow `7/8` drafts; its decode rate is neutral within noise.
 
 Baseline: `C:\tmp3\baseline-v175-expdec-mntq.exe`, SHA-256 `EBDE9940A3315B74F1073AAD6DE450088AF80BEEB88F8FC9BC4C27476C2B60AD`.
-Tested guarded variant: SHA-256 `7403DF95930CA329A74EDF96CF476A103C1F4F7823B5A0C35BFE47F0B9035ABF`.
-Promoted binary: `C:\tmp3\project-mantiq\build-ab\Release\mntq.exe`, SHA-256
-`AE7DBA544305A9FC0AE89CB75EB74377C7FD095D70FD8B2D76A6E1AEDCBE48F1`.
+Tested guarded variant: SHA-256 `7403DF95930CA329A74EDF96CF476A103C1F4F7823B5A0C35BFE47F0B9035ABF`
+(historical A/B artifact; not retained in the tree).
+Promoted binary: `C:\tmp3\project-mantiq\build-cuda\Release\mntq.exe`, SHA-256
+`81939C2CBF4B0AD83D9BB4A040ED1C506DD189FAC60BD795994866E5D1D6BA27`.
 
 Raw logs: `C:\tmp3\_mntq_bench\lookup_ab_code3.log`, `lookup_ab_control2.log`; harness `C:\tmp3\lookup_ab.ps1`.

@@ -840,14 +840,22 @@ class StrataEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
-        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        self.log = SharedLogSink(log) if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                                     stderr=subprocess.PIPE if log else subprocess.DEVNULL,
+                                     text=True, encoding="utf-8", bufsize=1, env=env)
+        if log:
+            threading.Thread(target=self._pump_stderr, args=(self.proc.stderr, self.log),
+                             daemon=True).start()
+        # A pump thread belongs to one process generation.  restart() calls __init__ again on the same object;
+        # the old pump must not be able to mark the new generation ended when its stdout finally closes.
+        self._pump_epoch = getattr(self, "_pump_epoch", 0) + 1
+        self.ended = False
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
@@ -859,8 +867,8 @@ class StrataEngine:
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
-        self.prefill_tok_s_mean = None
-        self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
+        self._prefill_tok_s_mean = None
+        self._progress = None            # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -939,18 +947,33 @@ class StrataEngine:
         self.ended = True
         wait_gpu_release(self.proc.pid)
 
+    def _pump_stderr(self, stream, sink):
+        """Drain the engine's stderr through the shared log writer, one whole line at a time."""
+        try:
+            for line in stream:
+                sink.write(line)
+            sink.flush()
+        except (OSError, ValueError):
+            pass
+
     def _pump(self):
-        for line in self.proc.stdout:
+        # Capture this generation's state.  restart() rebinds self.proc/lines/_routes; an old pump that reaches
+        # EOF late must not mark the NEW engine ended or inject sentinels into its queues.
+        proc, lines = self.proc, self.lines
+        routes, routes_lock, multi = self._routes, self._routes_lock, self.multi
+        epoch = self._pump_epoch
+        for line in proc.stdout:
             if line.startswith("VRAM "):
                 self._vram_line(line)
                 continue
-            if self.multi and self._route(line):
+            if multi and self._route(line, routes, routes_lock):
                 continue
-            self.lines.put(line)
-        self.ended = True                               # its output closed: it is gone, even before the OS says so
-        self.lines.put(None)
-        with self._routes_lock:
-            for q in self._routes.values():
+            lines.put(line)
+        if getattr(self, "_pump_epoch", -1) == epoch:  # only this generation's EOF ends this engine
+            self.ended = True                           # its output closed: it is gone, even before the OS says so
+        lines.put(None)
+        with routes_lock:
+            for q in routes.values():
                 q.put(None)
 
     def _vram_line(self, line: str) -> None:
@@ -962,14 +985,17 @@ class StrataEngine:
 
     _TAGGED = ("T ", "LP ", "PP ", "DONE ", "ERR ")
 
-    def _route(self, line: str) -> bool:
+    def _route(self, line: str, routes=None, routes_lock=None) -> bool:
         """Several conversations at once: a request's own lines (T / LP / PP / DONE / ERR <rid> ...) go to its queue, the
-        engine's (STAT, NOTE) are handled here; True when the line was taken."""
+        engine's (STAT, NOTE) are handled here; True when the line was taken.  The pump passes the routes it captured
+        at start so an EOF after a restart cannot write into the new engine's queue."""
+        routes = self._routes if routes is None else routes
+        routes_lock = self._routes_lock if routes_lock is None else routes_lock
         if line.startswith(self._TAGGED):
             f = line.split(None, 2)
             if len(f) >= 2 and f[1].isdigit():
-                with self._routes_lock:
-                    q = self._routes.get(int(f[1]))
+                with routes_lock:
+                    q = routes.get(int(f[1]))
                 if q is not None:
                     q.put(line)
                     return True
@@ -1106,6 +1132,34 @@ class StrataEngine:
             self._tls.last = v
         else:
             self._last = v
+
+    @property
+    def prefill_tok_s_mean(self):
+        """Prompt-read speed for this request thread; see `last` for why multi mode needs TLS."""
+        if self.multi:
+            return getattr(self._tls, "prefill_tok_s_mean", None)
+        return self._prefill_tok_s_mean
+
+    @prefill_tok_s_mean.setter
+    def prefill_tok_s_mean(self, v):
+        if self.multi:
+            self._tls.prefill_tok_s_mean = v
+        else:
+            self._prefill_tok_s_mean = v
+
+    @property
+    def progress(self):
+        """(read, total, reuse, ms) for this request thread, not another conversation's in multi mode."""
+        if self.multi:
+            return getattr(self._tls, "progress", None)
+        return self._progress
+
+    @progress.setter
+    def progress(self, v):
+        if self.multi:
+            self._tls.progress = v
+        else:
+            self._progress = v
 
     def _parse_done(self, line):
         f = line.split()
@@ -3453,7 +3507,7 @@ class Service:
                 done = (f"{fresh_done:,} of {fresh_total:,} tokens ({cached:,} cached)" if fresh_total
                         else f"0 tokens ({cached:,} cached)")
             else:
-                done = f"{s.get('prompt_tokens', 0):,}"   # an engine without PP lines: only the total is known
+                done = f"{s.get('prompt_tokens', 0):,} tokens"   # no PP lines: only the total is known
             print(f"[mntq] reading the prompt: {done}, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - r.first_token)
@@ -6414,9 +6468,9 @@ class ServerLogTee:
     no record of what it did: a request that waited minutes for its turn, an engine restarted mid-session, a queue that
     stopped moving.  That record is what a report of a stuck server needs."""
 
-    def __init__(self, stream, handle):
+    def __init__(self, stream, handle, lock=None):
         self.stream, self.handle = stream, handle
-        self.lock = threading.Lock()
+        self.lock = lock or threading.Lock()
 
     def write(self, text):
         with self.lock:
@@ -6464,19 +6518,57 @@ class StampedStdout:
         return getattr(self.stream, name)
 
 
+_LOG_WRITERS: dict[str, tuple[object, "threading.Lock"]] = {}
+_LOG_WRITERS_LOCK = threading.Lock()
+
+
+def _shared_log(path: str):
+    """One handle and one lock per log path.  The engine's stderr pump and the server's stdout tee must not
+    append to the same file through two independent handles: a line split across writes came out torn."""
+    key = os.path.abspath(path)
+    with _LOG_WRITERS_LOCK:
+        entry = _LOG_WRITERS.get(key)
+        if entry is None:
+            entry = (open(key, "a", encoding="utf-8", buffering=1), threading.Lock())
+            _LOG_WRITERS[key] = entry
+        return entry
+
+
+class SharedLogSink:
+    """A file-like sink used for the engine's stderr; routes every write through the shared log lock."""
+
+    def __init__(self, path: str):
+        self.handle, self.lock = _shared_log(path)
+
+    def write(self, text):
+        with self.lock:
+            try:
+                self.handle.write(text)
+            except (OSError, ValueError):
+                pass
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            try:
+                self.handle.flush()
+            except (OSError, ValueError):
+                pass
+
+
 def tee_server_log(path: str) -> None:
     """This server's own lines (`[mntq] ...`) go to `path` as well as this terminal (STRATA_SERVER_LOG=0: terminal
-    only).  The engine's stderr is already appended there, so the file tells both sides of a request."""
+    only).  The engine's stderr goes through the same handle and lock, so the file tells both sides of a request."""
     path = os.path.abspath(path)
     if not path or isinstance(sys.stdout, ServerLogTee):
         return
     try:
-        handle = open(path, "a", encoding="utf-8", buffering=1)
+        handle, lock = _shared_log(path)
     except OSError as e:
         print(f"[mntq] this server's lines cannot also go to {path} ({e}): they stay on this terminal", flush=True)
         return
     print(f"[mntq] this server's lines go to {path} too", flush=True)
-    sys.stdout = ServerLogTee(sys.stdout, handle)
+    sys.stdout = ServerLogTee(sys.stdout, handle, lock)
 
 
 def main() -> int:

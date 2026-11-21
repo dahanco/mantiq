@@ -46,12 +46,12 @@ import strata_tokenizer as T  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-DEFAULT_PACK = r"c:\tmp\pack-qwen35moe"
+DEFAULT_PACK = r"C:\tmp3\pack-qwen35moe"
 DEFAULT_GGUF = (r"C:\gguf\Qwopus\Qwopus3.6-35B-A3B-Coder-MTP-GGUF"
                 r"\Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf")
-DEFAULT_PROFILE = r"c:\tmp\qwen35moe-profile.bin"
+DEFAULT_PROFILE = r"C:\tmp3\qwen35moe-profile.bin"
 # the draft layer `tools/mtp_from_gguf.py --out <pack>/mtp` writes; absent means the engine drafts nothing
-DEFAULT_MTP = r"c:\tmp\pack-qwen35moe\mtp"
+DEFAULT_MTP = r"C:\tmp3\pack-qwen35moe\mtp"
 
 SPECIAL = {
     "im_start": "<|im_start|>",

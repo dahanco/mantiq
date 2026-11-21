@@ -333,9 +333,9 @@ struct Options {
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
-    int prompt_cache = 6;
+    int prompt_cache = 32;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
-    int64_t prompt_cache_every = 16384;
+    int64_t prompt_cache_every = 2048;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -387,15 +387,16 @@ unsigned lookup_size_mask(const Options& o) {
     if (o.lookup_max_t <= 0) return ~0u;
     const int s_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
     unsigned m = 0;
-    for (int t = 1; t <= s_mtp; ++t) m |= 1u << t;
+    auto add = [&](int t) { if (t >= 0 && t < 32) m |= 1u << t; };
+    for (int t = 1; t <= s_mtp; ++t) add(t);
     if (o.lookup_sizes.empty()) {
         for (int t : {s_mtp + 1, s_mtp + 2, o.lookup_max_t})
-            if (t >= 2 && t <= o.spec) m |= 1u << t;
+            if (t >= 2 && t <= o.spec) add(t);
     } else {
         size_t at = 0;
         while (at < o.lookup_sizes.size()) {
             const int t = std::atoi(o.lookup_sizes.c_str() + at);
-            if (t >= 2 && t <= o.spec) m |= 1u << t;
+            if (t >= 2 && t <= o.spec) add(t);
             const size_t comma = o.lookup_sizes.find(',', at);
             if (comma == std::string::npos) break;
             at = comma + 1;
@@ -505,9 +506,9 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from mntq-vision)\n"
-                 "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
+                 "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 32, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 2048, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -956,6 +957,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     const size_t L = c.ids.size();
     ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
     ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
+    ss.ple_token = L >= 1 ? c.ids[L - 1] : -1;
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -7696,16 +7698,18 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        const int mtp_cap = o.mtp_load_t > 0 ? o.mtp_load_t : S;
+        // The MTP is loaded with mtp_load_t (the pre-lookup --spec); never draft wider than its loaded graphs.
+        const int S_mtp = std::min(o.mtp_max_t > 0 ? o.mtp_max_t : S, std::min(S, mtp_cap));
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         policy.set_sizes(lookup_size_mask(o));  // --lookup-max-t: MTP sizes plus the lookup-only widths
         // A wide lookup window is verified by the whole window, but the MTP draft that follows stays S_mtp rows.
         // Past its reach, replay the accepted cells first (upstream Strata's MtpDrafter::draft_long split).
-        const auto draft_after_commit = [&](const int32_t* toks, int64_t pos0, int a, int32_t* d, float* pr,
+        const auto draft_after_commit = [&](int win, const int32_t* toks, int64_t pos0, int a, int32_t* d, float* pr,
                                             float min_p, std::string& e) -> bool {
-            if (a < S_mtp) return mtp.draft(S_mtp, toks, pos0, a, d, e, pr, min_p);
+            if (a < S_mtp) return mtp.draft(std::min(win, S_mtp), toks, pos0, a, d, e, pr, min_p);
             if (!mtp.prefill(ver.final_R_all(), toks, a + 1, pos0, e)) return false;
             return mtp.draft_first(1, ver.final_R(a), toks[a], pos0 + a, d, e, pr, min_p);
         };
@@ -8566,7 +8570,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 const bool drafted = eos || produced_n >= max_new ||
-                                     draft_after_commit(outv.data(), p, a, drafts.data(), dprob.data(),
+                                     draft_after_commit(T, outv.data(), p, a, drafts.data(), dprob.data(),
                                                         (float) req_spec_min_p, err);
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -9305,7 +9309,9 @@ int main(int argc, char** argv) {
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        const int mtp_cap = o.mtp_load_t > 0 ? o.mtp_load_t : o.spec;
+        // The MTP is loaded with mtp_load_t (the pre-lookup --spec); never draft wider than its loaded graphs.
+        const int S_mtp = std::min(o.mtp_max_t > 0 ? o.mtp_max_t : o.spec, std::min(o.spec, mtp_cap));
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         if (use_mtp && !first_window &&
             !mtp.draft_first(S_mtp, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
@@ -9318,9 +9324,9 @@ int main(int argc, char** argv) {
         // --lookup-max-t: a wide lookup window is verified, then the MTP catches up from the last accepted row.
         // Keep that draft at S_mtp rows (the upstream draft_long split) so a 12-row lookup does not make the MTP
         // draft 11 rows nobody proposed.  A lookup that accepted past the MTP's reach first replays those cells.
-        const auto draft_after_commit = [&](const int32_t* toks, int64_t pos0, int a, int32_t* d, float* pr,
+        const auto draft_after_commit = [&](int win, const int32_t* toks, int64_t pos0, int a, int32_t* d, float* pr,
                                             std::string& e) -> bool {
-            if (a < S_mtp) return mtp.draft(S_mtp, toks, pos0, a, d, e, pr, (float) o.spec_min_p);
+            if (a < S_mtp) return mtp.draft(std::min(win, S_mtp), toks, pos0, a, d, e, pr, (float) o.spec_min_p);
             if (!mtp.prefill(ver.final_R_all(), toks, a + 1, pos0, e)) return false;
             return mtp.draft_first(1, ver.final_R(a), toks[a], pos0 + a, d, e, pr, (float) o.spec_min_p);
         };
@@ -9469,7 +9475,7 @@ int main(int argc, char** argv) {
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
-                                 draft_after_commit(outv.data(), p, a, drafts.data(), dprob.data(), err);
+                                 draft_after_commit(T, outv.data(), p, a, drafts.data(), dprob.data(), err);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -9677,7 +9683,9 @@ int main(int argc, char** argv) {
                                 // qwen35moe path used to read a whole prompt without reporting chunks, so the
                                 // server's "reading the prompt" line showed the total even when a checkpoint
                                 // restored most of it.  The reused prefix is the 5th field, as in the artifact path.
-                                const int64_t done = p0 + T;
+                                // The last prompt token is the pending one and is consumed by the first decode window.
+                                // Count it here so the chunk bar and the closing bar both finish at pp_total.
+                                const int64_t done = std::min(pp_total, p0 + T + 1);
                                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                                 std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done,
                                             (long long) pp_total, ms,
@@ -10158,7 +10166,7 @@ int main(int argc, char** argv) {
                     if (n_out >= cap) break;
                     const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                     if (timed) policy.observe(from_sfx, T, a, sfx_match, round_ms);
-                    if (use_mtp && !draft_after_commit(outv.data(), p0, a, drafts.data(), dprob.data(), e)) {
+                    if (use_mtp && !draft_after_commit(T, outv.data(), p0, a, drafts.data(), dprob.data(), e)) {
                         turn_failed(e);
                         return 0;
                     }

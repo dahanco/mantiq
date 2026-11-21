@@ -42,7 +42,12 @@ static int expdec_nc() {
     static const int nc = [] {
         const char* v = std::getenv("MNTQ_EXPDEC_NC");
         const int n = v != nullptr ? std::atoi(v) : 4;
-        return n >= 1 && n <= 8 ? n : 4;
+        // Only 1/2/4/8 have kernels (the switch below). Snap other values down to the next supported width so
+        // MNTQ_EXPDEC_NC=3,5,6,7 do not silently become 1, and values outside 1..8 stay at the default 4.
+        if (n < 1 || n > 8) return 4;
+        if (n <= 2) return 2;
+        if (n <= 4) return 4;
+        return 8;
     }();
     return nc;
 }

@@ -37,6 +37,9 @@ option(MNTQ_IQK "use the IQK matrix multiplication kernels (the prompt path, N >
 set(GGML_IQK_MUL_MAT ${MNTQ_IQK} CACHE BOOL "ggml: use IQK matrix multiplication kernels" FORCE)
 if(MNTQ_CPU_PORTABLE)
   set(GGML_AVX2 ON CACHE BOOL "" FORCE)
+  # The portable zip promises AVX2 only.  BMI2 is compiled in unconditionally by ggml (__BMI2__/_pdep_u64)
+  # with no runtime dispatch, so an AVX2 CPU without BMI2 would fault on an IQ kernel.
+  set(GGML_BMI2 OFF CACHE BOOL "" FORCE)
 else()
   set(GGML_AVX_VNNI ON CACHE BOOL "" FORCE)
 endif()
