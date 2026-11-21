@@ -10028,9 +10028,12 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
-                // No turn token in this prompt: still keep one snapshot at the generation start so a request
-                // that drops that tail rewinds here rather than rereading the whole prompt.
-                if (native_serve && stages.empty() && checks.empty()) save_check("generation");
+                // ALWAYS keep one snapshot at the generation start, not only when the chain is empty: a client
+                // that re-sends the same conversation (a retry, or a turn whose answer was dropped) resumes here
+                // and re-reads one token instead of falling back to the last periodic chunk - measured at 80 to
+                // 1104 tokens re-read with `--prompt-cache-every` on and 1 token with it off.  `save_check`
+                // de-duplicates by position, so a prompt whose end is already in the chain costs nothing.
+                if (native_serve && stages.empty()) save_check("generation");
                 // The suffix drafter was seeded with the CLI's prompt and answer; a whole prompt here takes all of
                 // the turn's tokens, a delta skips its first one (the pending token, already in the drafter).
                 if (o.suffix_draft > 0)
