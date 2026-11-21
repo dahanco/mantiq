@@ -672,6 +672,21 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert, const int32_t* protect
     return victim;
 }
 
+bool ExpertCache::swap_resident(int64_t layer, int32_t out_expert, int32_t in_expert, int32_t slot) {
+    if (layer < 0 || layer >= n_layers_ || out_expert < 0 || out_expert >= n_expert_ || in_expert < 0 ||
+        in_expert >= n_expert_ || slot < 0 || slot >= slots_)
+        return false;
+    const size_t out = (size_t) (layer * n_expert_ + out_expert);
+    const size_t in = (size_t) (layer * n_expert_ + in_expert);
+    if (residency_[out] != slot) return false;   // the slot changed since the swap was planned
+    residency_[out] = kNotResident;
+    residency_[in] = slot;
+    slot_owner_[(size_t) slot] = (int32_t) in;
+    last_use_[(size_t) slot] = ++clock_;
+    ++evictions_;
+    return true;
+}
+
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];

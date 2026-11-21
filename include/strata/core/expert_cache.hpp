@@ -155,6 +155,12 @@ public:
     /// rather than corrupting.  `admit(l, e)` is the unprotected form.
     int32_t admit(int64_t layer, int64_t expert, const int32_t* protect = nullptr, int64_t n_protect = 0);
 
+    /// Swap the occupants of one slot without changing the slot count.  Used by the adaptive tier when it
+    /// promotes a routed miss into VRAM: the old tenant must have a host copy (a pinned mirror), so evicting
+    /// it just sends the next route to the CPU pool instead of back to the model file.  Returns false if the
+    /// slot is not owned by `out_expert`, so a stale swap cannot silently corrupt the residency table.
+    bool swap_resident(int64_t layer, int32_t out_expert, int32_t in_expert, int32_t slot);
+
     /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
     ///
     /// `admit`'s original policy hands out slots in ARRIVAL ORDER from one counter shared by every layer

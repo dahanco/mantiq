@@ -330,6 +330,13 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// A promoted miss must beat its victim's decayed route count by this much.  Lowering it makes the tier
+    /// more aggressive; 1.5f is the shipped value.
+    float adapt_gain = 1.5f;
+    /// Keep a pinned RAM mirror of the VRAM-resident experts too.  Without it an adaptive swap has no victim:
+    /// the RAM tier only holds the experts VRAM does not, so evicting a resident expert would send its next
+    /// route back to the model file.  Off by default: it costs about the VRAM tier's size in extra RAM.
+    bool expert_mirror = false;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -575,7 +582,11 @@ void usage() {
                  "                       clears the LFU gate (aged miss count >= 8 and above the victim's).  Default\n"
                  "                       off: a full pool refuses new experts forever, which is what confines a long\n"
                  "                       run to whatever the first tokens routed.\n"
-                 "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
+                 "  --expert-mirror      keep a pinned RAM mirror of the VRAM-resident experts so the adaptive tier\n"
+                  "                       can evict them without an SSD read.  Costs about the VRAM tier's size in\n"
+                  "                       extra RAM; off by default.\n"
+                  "  --adapt-gain F       a routed miss must beat its victim's decayed count by F (default 1.5).\n"
+                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
@@ -4723,6 +4734,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+        else if (a == "--adapt-gain") o.adapt_gain = (float) std::atof(next("--adapt-gain"));
         else if (a == "--spec-min-p") {
             o.spec_min_p = std::atof(next("--spec-min-p"));
             o.spec_min_p_set = true;
@@ -4789,6 +4801,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--expert-cache-evict") o.expert_cache_evict = true;
+        else if (a == "--expert-mirror") o.expert_mirror = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
@@ -6374,6 +6387,11 @@ int main(int argc, char** argv) {
         for (int64_t e = 0; e < g.n_expert; ++e)   // the unprofiled tail spread over the layers
             for (int64_t l = 0; l < g.n_layers; ++l)
                 if (!seen[(size_t) (l * g.n_expert + e)]) order.emplace_back((int32_t) l, (int32_t) e);
+        // --expert-mirror: also pin the VRAM tenants.  The adaptive tier can only evict a resident expert
+        // that has a stable host copy; without this the RAM tier is exactly the complement of VRAM and
+        // every swap is dropped.  The pairs are already in `drop` (released from the page cache), so they
+        // can be taken into the arena in the same pass.
+        if (o.expert_mirror) order.insert(order.end(), drop.begin(), drop.end());
         const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
         // The ladder the tiers follow: the GPUs took theirs above, so the RAM tier now takes every expert they
         // left - `want` is exactly those bytes - and only what will not fit in RAM is read from the SSD (or its
@@ -6388,6 +6406,9 @@ int main(int argc, char** argv) {
         mem_mark("the experts' RAM tier");
         std::fprintf(stderr, "mntq generate: experts: %s; read in %.1f s\n", gguf_src.note().c_str(),
                      gguf_src.load_seconds());
+        if (o.expert_mirror)
+            std::fprintf(stderr, "mntq generate: expert mirror: %lld VRAM tenants pinned in RAM for adaptive swaps\n",
+                         (long long) drop.size());
     }
 
     Drive drive;
@@ -7484,21 +7505,24 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     // A swap changes which expert a VRAM slot holds, so whatever it evicts has to have a home
-                    // behind it.  The RAM tier was built from the experts the GPUs left (generate's `order`, the
-                    // profile tail), so a slot's current tenant has NO RAM copy: evicting it sends the next route
-                    // of it back to the model file, which is the one thing the tier ladder exists to prevent.  A
-                    // victim the RAM tier holds (`stable`) falls back to the CPU path for free; one it does not is
-                    // left resident and the swap is dropped, so nothing this tier does reads the SSD.
+                    // behind it.  The RAM tier holds the experts the GPUs left, and with --expert-mirror also
+                    // the VRAM tenants themselves; only a victim the source calls `stable` can be evicted,
+                    // because then the next route falls back to the CPU pool instead of the model file.
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
                     else if (srcp->stable(l, e)) vict.emplace_back(u[e], e);
                 }
+                static const bool adapt_dbg = std::getenv("MNTQ_ADAPT_DEBUG") != nullptr;
+                if (adapt_dbg && l == 0)
+                    std::fprintf(stderr, "adapt dbg: candidates=%zu victims=%zu cand_top=%.1f vict_low=%.1f\n",
+                                 cand.size(), vict.size(), cand.empty() ? -1.0f : cand[0].first,
+                                 vict.empty() ? -1.0f : vict.back().first);
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_gain) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
@@ -7526,6 +7550,11 @@ int main(int argc, char** argv) {
                                            gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     return false;
                 }
+                // keep the cache's own residency table in step with host_res/d_res: the non-graph hit path,
+                // the staged-read planner and the learned profile all read slot_of()
+                if (!(gs ? gs->cache.swap_resident(s.layer, s.out, s.in, slot)
+                         : xcache.swap_resident(s.layer, s.out, s.in, slot)))
+                    return false;
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -8518,7 +8547,10 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                if (std::getenv("MNTQ_ADAPT_DEBUG") != nullptr)
+                std::fprintf(stderr, "adapt check: usage=%zu rounds=%lld every=%d\n", drive.d.usage.size(),
+                             (long long) rounds, o.adapt_every);
+            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -9211,21 +9243,24 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     // A swap changes which expert a VRAM slot holds, so whatever it evicts has to have a home
-                    // behind it.  The RAM tier was built from the experts the GPUs left (generate's `order`, the
-                    // profile tail), so a slot's current tenant has NO RAM copy: evicting it sends the next route
-                    // of it back to the model file, which is the one thing the tier ladder exists to prevent.  A
-                    // victim the RAM tier holds (`stable`) falls back to the CPU path for free; one it does not is
-                    // left resident and the swap is dropped, so nothing this tier does reads the SSD.
+                    // behind it.  The RAM tier holds the experts the GPUs left, and with --expert-mirror also
+                    // the VRAM tenants themselves; only a victim the source calls `stable` can be evicted,
+                    // because then the next route falls back to the CPU pool instead of the model file.
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
                     else if (srcp->stable(l, e)) vict.emplace_back(u[e], e);
                 }
+                static const bool adapt_dbg = std::getenv("MNTQ_ADAPT_DEBUG") != nullptr;
+                if (adapt_dbg && l == 0)
+                    std::fprintf(stderr, "adapt dbg: candidates=%zu victims=%zu cand_top=%.1f vict_low=%.1f\n",
+                                 cand.size(), vict.size(), cand.empty() ? -1.0f : cand[0].first,
+                                 vict.empty() ? -1.0f : vict.back().first);
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (cand[i].first < vict[i].first + o.adapt_gain) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
@@ -9240,6 +9275,10 @@ int main(int argc, char** argv) {
                     cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "mntq generate: an adaptive refill failed\n");
+                    return false;
+                }
+                if (!xcache.swap_resident(s.layer, s.out, s.in, slot)) {
+                    std::fprintf(stderr, "mntq generate: an adaptive refill failed (residency)\n");
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -9409,6 +9448,9 @@ int main(int argc, char** argv) {
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
             bool adapt_ok = true;
+            if (std::getenv("MNTQ_ADAPT_DEBUG") != nullptr)
+                std::fprintf(stderr, "adapt check: usage=%zu rounds=%lld every=%d\n", drive.d.usage.size(),
+                             (long long) rounds, o.adapt_every);
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
             const size_t produced0 = produced.size();
@@ -9821,9 +9863,13 @@ int main(int argc, char** argv) {
                 const int64_t NL = g.n_layers, NE = g.n_expert;
                 std::vector<uint8_t> resident((size_t) (NL * NE), 0);
                 for (int64_t il = 0; il < NL; ++il)
-                    for (int64_t e = 0; e < NE; ++e)
-                        if (xcache.slot_of(il, e) != strata::core::kNotResident)
-                            resident[(size_t) (il * NE + e)] = 1;
+                    for (int64_t e = 0; e < NE; ++e) {
+                        // host_res/d_res are what the token graph and the adaptive tier keep current;
+                        // xcache.slot_of is the startup plan and no longer tracks swaps.
+                        const int32_t slot = !host_res.empty() ? host_res[(size_t) (il * NE + e)]
+                                                              : xcache.slot_of(il, e);
+                        if (slot != strata::core::kNotResident) resident[(size_t) (il * NE + e)] = 1;
+                    }
                 const std::vector<double> heat(drive.d.usage.begin(), drive.d.usage.end());
                 std::string e;
                 if (strata::core::write_expert_profile(o.expert_profile_save, NL, NE,
