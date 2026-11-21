@@ -1,8 +1,9 @@
-# Upstream Strata ports (Mantiq 1.7.5 work tree)
+# Upstream Strata ports (Mantiq 1.7.6 work tree)
 
 Three ports from upstream Strata `3142b66b` are present in this work tree. Guarded suffix-lookup windows are
 promoted to the default on one-GPU CUDA; PLE compact/copy-stream and EXPDEC remain opt-in and off by default.
-The released `v1.7.5` binaries do not contain any of them. The promoted CUDA build is `build-ab`
+The released `v1.7.6` binaries contain the promoted lookup window and the EXPDEC/PLE code behind their flags.
+The promoted CUDA build is `build-ab`
 (CUDA 13.4, `sm_75;80;86;89`, `STRATA_NATIVE_EXPERTS=ON`, `STRATA_PORTABLE=ON`).
 
 ## PLE compact read-ahead — `MNTQ_PLE_COMPACT`, `MNTQ_PLE_COPY_STREAM`
