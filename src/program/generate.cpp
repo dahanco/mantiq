@@ -9575,6 +9575,10 @@ int main(int argc, char** argv) {
             uint64_t check_clock = 0;
             // The reader thread's own flag (set up below): a STOP has to reach a request that is still running.
             std::atomic<bool> stop_req{false};
+            // Prompt progress for the server window; the qwen35moe prefill callback reports each chunk against
+            // these (the artifact path above has its own, in a different scope).
+            int64_t pp_total = 0, pp_from = 0;
+            Clock::time_point pp_t0 = Clock::now();
             // A NEW CONVERSATION ON THE SAME RESIDENCY (`RESET`, the page's New chat; also a `--serve` request
             // whose conversation is not a continuation of this state).  Everything that makes the current
             // sequence what it is goes back to its start - the K/V, the GDN recurrence and the PLE history
@@ -9667,7 +9671,22 @@ int main(int argc, char** argv) {
                             };
                         qpf->on_chunk = [&, mh](const float* R_rows, int64_t T, int64_t p0, std::string& ee) -> bool {
                             strata::core::progress_beat();   // a chunk can outlast the serve watchdog's silence
-                            return dump_prompt_rows(R_rows, T, p0, ee) && (!mh || mh(R_rows, T, p0, ee));
+                            if (!dump_prompt_rows(R_rows, T, p0, ee) || (mh && !mh(R_rows, T, p0, ee))) return false;
+                            if (o.serve) {
+                                // PP <position reached> <prompt tokens> <ms> <fresh tok/s> <reused>: the native
+                                // qwen35moe path used to read a whole prompt without reporting chunks, so the
+                                // server's "reading the prompt" line showed the total even when a checkpoint
+                                // restored most of it.  The reused prefix is the 5th field, as in the artifact path.
+                                const int64_t done = p0 + T;
+                                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                                std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done,
+                                            (long long) pp_total, ms,
+                                            ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0,
+                                            (long long) pp_from);
+                                strata::core::progress_at("reading the prompt (native qwen), done up to token", done);
+                                std::fflush(stdout);
+                            }
+                            return true;
                         };
                         qpf->should_stop = [&] { return stop_req.load(); };
                         if (!qpf->run(t.data(), (int64_t) t.size() - 1, base0, e)) {
@@ -9985,6 +10004,9 @@ int main(int argc, char** argv) {
                 }
                 std::string e;
                 const Clock::time_point read_t0 = Clock::now();
+                pp_total = (int64_t) ids.size();   // the whole re-sent prompt, reused prefix included
+                pp_from = reused;                  // what this request did not read again
+                pp_t0 = read_t0;
                 // READ THE TURN, SAVING A CHECKPOINT AT EACH TURN/SEAM BOUNDARY.  The cut points are indices in
                 // `turn` (whose element 0 is the pending token): the generation seam (`open=N`), every
                 // `<|im_start|>` after the first (a conversation turn), and periodic chunk ends.  read_turn takes
@@ -10026,6 +10048,14 @@ int main(int argc, char** argv) {
                 if (!read_ok) {
                     turn_failed(e);
                     continue;
+                }
+                if (pp_total > 0) {   // the last prompt token is the pending one; close the progress bar at N
+                    const int64_t done = pp_total;
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                    std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) pp_from);
+                    strata::core::progress_at("reading the prompt (native qwen), done up to token", done);
+                    std::fflush(stdout);
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - read_t0).count();
                 // ALWAYS keep one snapshot at the generation start, not only when the chain is empty: a client

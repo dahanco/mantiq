@@ -3444,9 +3444,17 @@ class Service:
             r = self.latest_request if self.latest_request in self.current_requests else None
         el = now - s.get("started", now)
         if r is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[mntq] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens, reused, ms) from PP
+            if pr and pr[1]:
+                total = max(0, int(pr[1]))
+                cached = min(total, max(0, int(pr[2]) if len(pr) > 2 else 0))
+                fresh_total = total - cached
+                fresh_done = max(0, min(fresh_total, int(pr[0]) - cached))
+                done = (f"{fresh_done:,} of {fresh_total:,} tokens ({cached:,} cached)" if fresh_total
+                        else f"0 tokens ({cached:,} cached)")
+            else:
+                done = f"{s.get('prompt_tokens', 0):,}"   # an engine without PP lines: only the total is known
+            print(f"[mntq] reading the prompt: {done}, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - r.first_token)
             print(f"[mntq] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
