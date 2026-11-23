@@ -893,6 +893,93 @@ def qwen_expert_profile(pack: Path) -> Path | None:
     return write_expert_profile(dst, layers, dims[1])
 
 
+def refresh_qwen_profiles(only: Path | None = None) -> bool:
+    """Rebuild the VRAM expert profile of EVERY configured qwen35moe model from its own routing.
+
+    This is the general form of the one-off profile fix: no hand-picked model, no shipped ranking.  For each
+    config with a 40x256 qwen35moe pack the engine is started once on a fixed synthetic token sequence with
+    --dump-routing (prompts are not needed to learn which experts a model routes), the trace is replayed by
+    tools/make_profile.py --reorder, and both files are written back into the pack.  Failures are reported and
+    skipped: a model that cannot start must keep the profile it had.
+    """
+    ids = ",".join(str(100 + (i % 200)) for i in range(1024))
+    touched = failed = 0
+    seen: set[Path] = set()
+    for cfg_path in configs():
+        if only is not None and cfg_path.resolve() != only.resolve():
+            continue
+        cfg = read_json(cfg_path)
+        args = list(cfg.get("args") or [])
+        if "--native" not in args or "--expert-profile" not in args:
+            continue
+        profile = Path(args[args.index("--expert-profile") + 1])
+        if profile in seen:
+            continue
+        seen.add(profile)
+        pack = profile.parent
+        native = pack / "native_experts.txt"
+        if not native.is_file():
+            continue
+        text = native.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"n_expert (\d+)", text)
+        layers = sum(1 for line in text.splitlines() if line[:1].isdigit())
+        if not m or layers < 1:
+            continue
+        dims = (layers, int(m.group(1)))
+        trace = pack / QWEN_TRACE
+        used = trace if trace.is_file() and trace.stat().st_size >= 1000 else pack / "routing-trace.refresh.bin"
+        if used == trace:
+            say(f"  {cfg_path.name}: rebuilding from this model's own routing trace ({dims[0]}x{dims[1]}) ...")
+        else:
+            say(f"  {cfg_path.name}: capturing this model's routing ({dims[0]} layers x {dims[1]} experts) ...")
+            temp_save = pack / "expert-profile.save-refresh.bin"
+            cargs = list(args)
+            # Never let a capture overwrite the real profile with a one-off learned table.
+            if "--expert-profile-save" in cargs:
+                i = cargs.index("--expert-profile-save")
+                if i + 1 < len(cargs):
+                    cargs[i + 1] = str(temp_save)
+                else:
+                    cargs.append(str(temp_save))
+            else:
+                cargs += ["--expert-profile-save", str(temp_save)]
+            cargs += ["--dump-routing", str(used), "--tokens", ids,
+                      "--max-new", "256", "--prefill", "256", "--stats"]
+            env = dict(os.environ)
+            env.update(cfg.get("env") or {})
+            env.pop("MNTQ_EXPERT_PROFILE_SAVE", None)
+            try:
+                p = subprocess.run([cfg.get("exe") or str(EXE), *cargs],
+                                   cwd=cfg.get("cwd") or str(ROOT), env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=1800)
+            except Exception as e:                   # no engine, no GPU: leave this model's profile alone
+                warn(f"{cfg_path.name}: the capture could not run ({e}); profile left unchanged")
+                failed += 1
+                continue
+            if p.returncode != 0 or not used.is_file() or used.stat().st_size < 1000:
+                warn(f"{cfg_path.name}: the capture failed (exit {p.returncode}); profile left unchanged")
+                warn((p.stderr or p.stdout or "")[-300:].strip())
+                failed += 1
+                continue
+        new_profile = pack / "expert-profile.refresh.bin"
+        r = subprocess.run([sys.executable, str(ROOT / "tools" / "make_profile.py"), str(used),
+                            "--base", str(profile), "--reorder", "--n-layer", str(dims[0]),
+                            "--n-expert", str(dims[1]), "--out", str(new_profile)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or profile_dims(new_profile) != dims:
+            warn(f"{cfg_path.name}: the profile rebuild failed; profile left unchanged")
+            failed += 1
+            continue
+        if used != trace:
+            shutil.copyfile(used, trace)
+        shutil.copyfile(new_profile, profile)
+        ok(f"{cfg_path.name}: rebuilt {profile.name} from {trace.name}")
+        touched += 1
+    ok(f"refreshed {touched} expert profile(s); {failed} failed")
+    return touched > 0 or failed == 0
+
+
 def glm_expert_profile(pack: Path) -> Path:
     """The `--expert-profile` a GLM model reads at load and --expert-profile-save rewrites after each request, kept
     inside the model's own folder (<pack>/expert-profile.bin, as a qwen35moe pack's and DeepSeek's are) so a model's
@@ -7621,6 +7708,10 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
+    # A fresh install builds its own VRAM residency table from this model's own routing, not from a shipped
+    # ranking: that is what makes the decode profile general across models instead of tuned for one file.
+    if not os.environ.get("MNTQ_SKIP_PROFILE_CAPTURE"):
+        refresh_qwen_profiles(only=cfg_path)
     return cfg_path
 
 
@@ -8387,6 +8478,9 @@ def main() -> int:
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
+    ap.add_argument("--refresh-profiles", action="store_true",
+                    help="rebuild every qwen35moe model's VRAM expert profile from a fresh capture of its own routing "
+                         "(one short engine run per model; no prompt data needed) and exit")
     ap.add_argument("--report", action="store_true", help="write mntq-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
                                                           "speed (nothing is sent anywhere)")
@@ -8428,6 +8522,8 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "mntq.sh"), *sys.argv[1:]], dict(os.environ, MNTQ_SH="1"))
     version = mntq_version()
+    if a.refresh_profiles:
+        return 0 if refresh_qwen_profiles() else 1
     if a.report:
         return report(version, a.backend, a.config)
     if a.import_model:
