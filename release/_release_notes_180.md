@@ -1,10 +1,10 @@
 ## Mantiq 1.8.0 — trace-built expert residency
 
-This release changes **data, not engine code**. The shipped expert profile for
-`Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M` was stale: its first 859 VRAM slots covered
-only 7.5-10.8% of the experts actually routed during decode. The profile is now
-ranked from real decode routing traces, so the VRAM tier starts with the experts
-this model and workload actually use.
+This release changes **pack data and the setup tooling, not the C++/CUDA engine**.
+The shipped expert profile for `Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M` was stale: its
+first 859 VRAM slots covered only 7.5-10.8% of the experts actually routed during
+decode. Profiles are now ranked from each model's own routing trace, and setup
+does that for every qwen35moe pack rather than for one hand-tuned model.
 
 ### What changed
 
@@ -15,6 +15,14 @@ this model and workload actually use.
   concatenation, so a fresh setup regenerates 854 of the same 859 top slots even
   if the profile file is absent.
 - Originals are kept beside them as `*.pre-combined`.
+- `mntq.py` gains `--refresh-profiles`: it discovers every configured qwen35moe
+  pack, reuses its routing trace (or captures one with a short synthetic-token
+  decode when it has none), rebuilds the profile with `make_profile.py --reorder`
+  and writes both files back. Setup calls it for each newly written qwen config,
+  so a fresh install builds its own VRAM residency table. Set
+  `MNTQ_SKIP_PROFILE_CAPTURE=1` to opt out. All five configured packs were
+  refreshed; the other four already had traces matching their profiles, while
+  Apex gained its first real profile (11.6% -> 18.2% VRAM hits, 75.0 -> 80.9 tok/s).
 - `VERSION` is 1.8.0 in the main tree and both portable packages; the
   `MNTQ-BUILD.json` version fields are synced. No engine source changed, so the
   build-stamp source hashes are unchanged.
@@ -39,11 +47,12 @@ and rejected in favour of the equal-weighted one.
 - The profile is trained on two prompt shapes. `--expert-profile-save` will keep
   learning at runtime; for a different workload, recapture with `--dump-routing`
   and rebuild with `tools/make_profile.py` (see the release notes in the repo).
-- This is a pack data change. Other model packs keep their own profiles.
+- The general refresh learns from existing routing traces; a model whose trace is
+  stale should be recaptured with `mntq.py --refresh-profiles` after a workload change.
 - Both portable binaries were rebuilt from this tree and embed 1.8.0; the
   verifier confirmed `has1.8.0=True` for `mntq-cpu.exe` and `mntq.exe`.
 
 | File | SHA-256 |
 | --- | --- |
-| `Mantiq-Portable-CPU.zip` | `24EE884A6423FBF6E66E95E3AC61D7E1C95AB18BE31BA21213FF97337B5EA1DB` |
-| `Mantiq-Portable-CUDA.zip` | `1ADD9317C42E28FD1FC806C964F786ED2B88F998462A9AA8052E543445F5A3F1` |
+| `Mantiq-Portable-CPU.zip` | `CC282E5421AC16F8883A7DD46DF4291130D08D74DD0920DE58DACB03928DD717` |
+| `Mantiq-Portable-CUDA.zip` | `3D29F64AD98FE9F1C8E4FE49BEF14E544F52A96D270C09ED4719F9E97B207D71` |
