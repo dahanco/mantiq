@@ -15,20 +15,8 @@ dashboard, and an OpenAI-compatible API &mdash; all in one process, on one machi
 
 <p align="center"><sub>Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMax-M3.1-Flash · nothing leaves your machine</sub></p>
 
-<!--
-  DEMO MEDIA PLACEHOLDER - replace before launch:
-  1. Open the dashboard at http://127.0.0.1:7711 while a model streams tokens,
-     with the live tok/s counter visible; record a short GIF and grab a PNG still.
-  2. Save them as assets/dashboard-demo.gif and assets/dashboard.png.
-  3. Replace the placeholder box below with:
-     <p align="center"><img src="assets/dashboard-demo.gif" alt="Mantiq web dashboard at http://127.0.0.1:7711 streaming tokens with a live tok/s counter" width="760"></p>
--->
-
-<table align="center"><tr><td align="center" width="780">
-  <b>▶ LIVE DASHBOARD DEMO &mdash; real-time token generation (tok/s)</b><br>
-  <i>[ placeholder: add <code>assets/dashboard-demo.gif</code> (or <code>assets/dashboard.png</code>) here ]</i><br>
-  <sub>Dashboard at <code>http://127.0.0.1:7711</code> &mdash; watch tokens stream in with a live tok/s counter</sub>
-</td></tr></table>
+<p align="center"><img src="assets/dashboard-demo.gif" alt="Mantiq web dashboard at http://127.0.0.1:7711 streaming tokens with a live tok/s counter" width="760"></p>
+<p align="center"><sub>Live from the Mantiq dashboard at <code>http://127.0.0.1:7711</code> &mdash; watch tokens stream in with a live tok/s counter</sub></p>
 
 <p align="center"><b><a href="#download">⚡ Download for Windows &mdash; no build required</a></b></p>
 
