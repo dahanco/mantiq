@@ -2,8 +2,48 @@
 
 <h1 align="center">Mantiq</h1>
 
-<p align="center"><b>A fast inference engine for large MoE models, on the hardware you already own</b><br>
-Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMax-M3.1-Flash · private, local, nothing leaves your machine</p>
+<p align="center">
+  <a href="https://github.com/dahanco/mantiq/blob/main/LICENSE"><img src="https://img.shields.io/github/license/dahanco/mantiq?style=for-the-badge" alt="License: MIT"></a>
+  <a href="https://github.com/dahanco/mantiq/releases/latest"><img src="https://img.shields.io/github/v/release/dahanco/mantiq?style=for-the-badge" alt="Latest release"></a>
+  <a href="https://github.com/dahanco/mantiq#quick-start"><img src="https://img.shields.io/badge/CUDA-13%2B-76B900?style=for-the-badge&amp;logo=nvidia&amp;logoColor=white" alt="CUDA 13+"></a>
+  <a href="https://github.com/dahanco/mantiq#quick-start"><img src="https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-2f80ed?style=for-the-badge" alt="Windows, Linux, macOS"></a>
+</p>
+
+<p align="center"><b>Run 35B-parameter MoE models on the desktop you already own &mdash; privately, and 1.9&times; faster at decode than llama.cpp.</b><br>
+Mantiq is a <b>standalone inference engine</b>, not a wrapper: expert tiering across VRAM &rarr; RAM &rarr; NVMe, a live web
+dashboard, and an OpenAI-compatible API &mdash; all in one process, on one machine.</p>
+
+<p align="center"><sub>Qwen3.5/3.6-MoE (35B-A3B) · GLM-5.3-Flash · DeepSeek-V4.1-Flash-1017 · MiniMax-M3.1-Flash · nothing leaves your machine</sub></p>
+
+<!--
+  DEMO MEDIA PLACEHOLDER - replace before launch:
+  1. Open the dashboard at http://127.0.0.1:7711 while a model streams tokens,
+     with the live tok/s counter visible; record a short GIF and grab a PNG still.
+  2. Save them as assets/dashboard-demo.gif and assets/dashboard.png.
+  3. Replace the placeholder box below with:
+     <p align="center"><img src="assets/dashboard-demo.gif" alt="Mantiq web dashboard at http://127.0.0.1:7711 streaming tokens with a live tok/s counter" width="760"></p>
+-->
+
+<table align="center"><tr><td align="center" width="780">
+  <b>▶ LIVE DASHBOARD DEMO &mdash; real-time token generation (tok/s)</b><br>
+  <i>[ placeholder: add <code>assets/dashboard-demo.gif</code> (or <code>assets/dashboard.png</code>) here ]</i><br>
+  <sub>Dashboard at <code>http://127.0.0.1:7711</code> &mdash; watch tokens stream in with a live tok/s counter</sub>
+</td></tr></table>
+
+<p align="center"><b><a href="#download">⚡ Download for Windows &mdash; no build required</a></b></p>
+
+<a id="download"></a>
+
+> [!IMPORTANT]
+> ## ⚡ Try Mantiq right now &mdash; Windows prebuilt, zero build steps
+> Download, unzip, double-click `START-MNTQ.bat`. The first launch asks which model to fetch &mdash; no compiler, no CUDA toolkit, no Python install, nothing added to `PATH`.
+>
+> | Package | Get it (latest: v1.8.0) | Runs on |
+> | --- | --- | --- |
+> | 🚀 **CUDA** &mdash; full speed | **[Mantiq-Portable-CUDA.zip](https://github.com/dahanco/mantiq/releases/latest/download/Mantiq-Portable-CUDA.zip)** (~600 MB) | NVIDIA GPU, compute capability 7.5+, CUDA 13-capable driver |
+> | 💻 **CPU** &mdash; any 64-bit PC | **[Mantiq-Portable-CPU.zip](https://github.com/dahanco/mantiq/releases/latest/download/Mantiq-Portable-CPU.zip)** (~45 MB) | AVX2 CPU, no GPU needed |
+>
+> Both ship the engine, Python and the dashboard; **models download on first start**. [All releases](https://github.com/dahanco/mantiq/releases) · [v1.8.0 checksums](https://github.com/dahanco/mantiq/releases/tag/v1.8.0)
 
 ## Measured speed: decode, same model, same PC
 
@@ -145,22 +185,9 @@ package targets compute capability 7.5+ and needs an NVIDIA driver that supports
 supported experimentally, and Apple Silicon through Metal for GLM-5.3-Flash. The setup checks all of it and prints the
 exact command for anything missing; it installs nothing system-wide.
 
-### Prebuilt packages (Windows, nothing to build)
-
-Two ready-to-run packages are published with every [release](https://github.com/dahanco/mantiq/releases/latest). Unzip
-one, double-click `START-MNTQ.bat`, and the first start asks for the model and downloads it - no compiler, no CUDA
-toolkit, no Python to install, and nothing is put on `PATH`:
-
-| Package | Runs on | Inside |
-| --- | --- | --- |
-| `Mantiq-Portable-CUDA.zip` (about 600 MB) | an NVIDIA PC with compute capability 7.5+ and a CUDA 13-capable driver | the compiled engine (`build\mntq.exe`) with its CUDA libraries, Mantiq's Python and its packages, and the stamped sources the engine was built from |
-| `Mantiq-Portable-CPU.zip` (about 45 MB) | any 64-bit PC with AVX2, no GPU needed | the same dashboard on `ggml`'s CPU engine (`build-cpu\mntq-cpu.exe`) and the same Python |
-
-A Vulkan package also exists, but it is experimental and has not been refreshed with every release (the current one is
-1.6.2). It is not part of the 1.7.6 release assets.
-
-None of them carries a model: nothing is downloaded until the start asks, and a GGUF you already have can be added
-instead (below).
+**Prebuilt packages (Windows, nothing to build):** the CUDA and CPU portable zips are linked in the
+[download callout](#download) at the top &mdash; unzip, double-click `START-MNTQ.bat`, and the first start downloads the
+model. A Vulkan package also exists but is experimental and is not refreshed with every release.
 
 ## Models that run on it
 
